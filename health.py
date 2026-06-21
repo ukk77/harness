@@ -165,7 +165,7 @@ class HealthChecker:
 
 def print_health_report(report: HealthReport) -> None:
     """Print health report in a formatted table."""
-    status_icon = {"OK": "✓", "WARN": "⚠", "FAIL": "✗"}
+    status_icon = {"OK": "[OK]", "WARN": "[WARN]", "FAIL": "[FAIL]"}
     print(f"\n{'='*65}")
     print(f"HARNESS HEALTH CHECK — {report.timestamp.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'='*65}")

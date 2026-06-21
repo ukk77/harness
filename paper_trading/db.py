@@ -54,7 +54,36 @@ def init_db(db_path: Optional[Path] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_positions_ticker  ON positions(ticker);
             CREATE INDEX IF NOT EXISTS idx_trades_ticker     ON trades(ticker);
             CREATE INDEX IF NOT EXISTS idx_trades_executed   ON trades(executed_at);
+
+            CREATE TABLE IF NOT EXISTS regime_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at       TEXT    NOT NULL,
+                regime          TEXT    NOT NULL,
+                allocation_mode TEXT    NOT NULL,
+                allocations_json TEXT   NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_regime_log_date ON regime_log(logged_at);
         """)
+        conn.commit()
+
+
+def save_regime_log(
+    regime: str,
+    allocation_mode: str,
+    allocations: List[Dict[str, Any]],
+    db_path: Optional[Path] = None,
+) -> None:
+    """Persist a regime + allocation snapshot to regime_log table."""
+    db_path = db_path or _DEFAULT_DB
+    init_db(db_path)
+    logged_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO regime_log (logged_at, regime, allocation_mode, allocations_json) "
+            "VALUES (?, ?, ?, ?)",
+            (logged_at, regime, allocation_mode, json.dumps(allocations)),
+        )
         conn.commit()
 
 

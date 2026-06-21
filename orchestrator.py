@@ -25,6 +25,9 @@ from .adapters.mr_adapter import MRAdapter
 from .adapters.tf_adapter import TFAdapter
 from .adapters.vb_adapter import VBAdapter
 from .config import HarnessConfig, get_config
+from .regime import Regime, detect_regime
+from .allocator import CapitalAllocator
+from .paper_trading.db import save_regime_log
 
 log = logging.getLogger(__name__)
 _TRADING_ROOT = Path(__file__).resolve().parent.parent
@@ -35,7 +38,7 @@ def _progress(done: int, total: int, label: str = "") -> None:
     pct = done / total * 100 if total else 0
     bar_len = 30
     filled = int(bar_len * done // max(total, 1))
-    bar = "█" * filled + "░" * (bar_len - filled)
+    bar = "#" * filled + "-" * (bar_len - filled)
     suffix = f" {label}" if label else ""
     print(f"\r  [{bar}] {pct:5.1f}%  {done}/{total}{suffix}   ", end="", flush=True)
     if done >= total:
@@ -80,6 +83,32 @@ class Orchestrator:
         Returns:
             { "AAPL": [rl_signal, mr_signal, ...], ... }
         """
+        # D1/D2: Detect market regime using SPY and compute regime-aware allocation
+        regime = Regime.RANGE_BOUND
+        allocation = None
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(str(_TRADING_ROOT), "risk_calculator", "backend"))
+            from app.services.market_data import fetch_ohlcv
+            spy_ohlcv = fetch_ohlcv("SPY", lookback_days=252)
+            regime = detect_regime(spy_ohlcv)
+            allocation = CapitalAllocator(self.cfg).allocate_for_regime(regime)
+            log.info("[orchestrator] Regime=%s | Mode=%s", regime.value, allocation.mode)
+            print(f"  Regime: {regime.value.upper()}  |  Allocation: " +
+                  "  ".join(f"{a.strategy}={a.capital:,.0f}" for a in allocation.allocations))
+            # D3: Log regime + allocation to harness_trades.db
+            save_regime_log(
+                regime=regime.value,
+                allocation_mode=allocation.mode,
+                allocations=[{
+                    "strategy": a.strategy,
+                    "capital": round(a.capital, 2),
+                    "weight": round(a.weight, 4),
+                    "sharpe": a.sharpe,
+                } for a in allocation.allocations],
+            )
+        except Exception as exc:
+            log.warning("[orchestrator] Regime detection failed: %s", exc)
         # Build (ticker, strategy, adapter) task list
         if tickers:
             # Explicit override — run all active strategies against the given tickers
@@ -120,10 +149,10 @@ class Orchestrator:
                     with lock:
                         results[ticker].append(sig)
                         done_count += 1
-                        _progress(done_count, total, f"{strategy}:{ticker} → {sig.action}")
-                    log.debug("%s:%s → %s (conf=%.2f)", strategy, ticker, sig.action, sig.confidence)
+                        _progress(done_count, total, f"{strategy}:{ticker} -> {sig.action}")
+                    log.debug("%s:%s -> %s (conf=%.2f)", strategy, ticker, sig.action, sig.confidence)
                 except Exception as e:
-                    log.error("Error %s:%s — %s", strategy, ticker, e)
+                    log.error("Error %s:%s - %s", strategy, ticker, e)
                     with lock:
                         results[ticker].append(HarnessSignal(
                             ticker=ticker,
@@ -135,11 +164,11 @@ class Orchestrator:
                             reason=f"Error: {e}",
                         ))
                         done_count += 1
-                        _progress(done_count, total, f"{strategy}:{ticker} → ERROR")
+                        _progress(done_count, total, f"{strategy}:{ticker} -> ERROR")
 
         elapsed = time.time() - t0
         total_signals = sum(len(v) for v in results.values())
-        print(f"  Done — {total_signals} signals in {elapsed:.1f}s")
+        print(f"  Done - {total_signals} signals in {elapsed:.1f}s")
         log.info("Orchestrator: %d signals, %d tickers, %.1fs", total_signals, len(all_tickers), elapsed)
 
         self._log_signals(results)
@@ -150,7 +179,7 @@ class Orchestrator:
         log_path = Path(self.cfg.logs_dir) / "harness_signals.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with open(log_path, "a") as f:
+            with open(log_path, "a", encoding="utf-8") as f:
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 f.write(f"\n--- {ts} ---\n")
                 for ticker, signals in sorted(results.items()):

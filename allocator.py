@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from .config import HarnessConfig, get_config
+from .regime import Regime
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +43,37 @@ class AllocationResult:
     def position_cap(self, ticker: str, cfg: HarnessConfig) -> float:
         """Max $ per ticker across the whole portfolio."""
         return cfg.total_capital * cfg.max_position_pct
+
+
+# Regime multipliers per strategy.
+# Values < 1.0 reduce capital for that strategy in this regime;
+# values > 1.0 increase it (subject to max_strategy_pct cap after re-normalisation).
+_REGIME_MULTIPLIERS: Dict[Regime, Dict[str, float]] = {
+    Regime.BULL_TREND: {
+        "mr":  0.6,   # mean-reversion underperforms in strong trends
+        "tf":  1.4,   # trend-following excels
+        "vb":  1.2,   # breakouts are more reliable in bull markets
+        "rl":  1.0,
+    },
+    Regime.BEAR_TREND: {
+        "mr":  0.8,
+        "tf":  1.3,   # short-side trend following still relevant
+        "vb":  0.7,   # fewer clean breakouts in bear markets
+        "rl":  1.0,
+    },
+    Regime.HIGH_VOL: {
+        "mr":  1.2,   # mean-reversion can capture overshoots
+        "tf":  0.7,   # trends break down in high volatility
+        "vb":  0.9,
+        "rl":  0.8,   # RL agents trained on normal vol may struggle
+    },
+    Regime.RANGE_BOUND: {
+        "mr":  1.4,   # ideal regime for mean-reversion
+        "tf":  0.6,
+        "vb":  0.8,
+        "rl":  1.0,
+    },
+}
 
 
 class CapitalAllocator:
@@ -104,6 +136,52 @@ class CapitalAllocator:
                 a.weight = a.capital / self.cfg.total_capital
 
         return AllocationResult(self.cfg.total_capital, allocations, "sharpe_weighted")
+
+    def allocate_for_regime(self, regime: Regime) -> AllocationResult:
+        """Sharpe-weighted allocation scaled by regime-specific multipliers.
+
+        1. Compute base Sharpe-weighted allocation.
+        2. Apply _REGIME_MULTIPLIERS for the current regime.
+        3. Re-normalise weights to 1.0, enforce max_strategy_pct cap.
+
+        Returns an AllocationResult with mode set to "regime:<regime_value>".
+        """
+        base = self._sharpe_weighted()
+        multipliers = _REGIME_MULTIPLIERS.get(regime, {})
+
+        adjusted: List[StrategyAllocation] = []
+        for a in base.allocations:
+            mult = multipliers.get(a.strategy, 1.0)
+            adjusted.append(StrategyAllocation(
+                strategy=a.strategy,
+                capital=a.capital * mult,
+                weight=a.weight * mult,
+                sharpe=a.sharpe,
+            ))
+
+        # Re-normalise
+        total_w = sum(a.weight for a in adjusted)
+        if total_w > 0:
+            for a in adjusted:
+                a.weight = min(a.weight / total_w, self.cfg.max_strategy_pct)
+
+        # Second pass: re-normalise after cap
+        total_w2 = sum(a.weight for a in adjusted)
+        for a in adjusted:
+            if total_w2 > 0:
+                a.weight = a.weight / total_w2
+            a.capital = self.cfg.total_capital * a.weight
+
+        log.info(
+            "[allocator] Regime=%s | %s",
+            regime.value,
+            " | ".join(f"{a.strategy}={a.capital:,.0f}" for a in adjusted),
+        )
+        return AllocationResult(
+            total_capital=self.cfg.total_capital,
+            allocations=adjusted,
+            mode=f"regime:{regime.value}",
+        )
 
     def _mean_sharpe(self, strategy: str) -> float:
         """Read mean Sharpe from result JSON files for the given strategy."""

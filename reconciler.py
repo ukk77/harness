@@ -36,7 +36,7 @@ class ReconciledSignal:
 
     def __str__(self) -> str:
         votes_str = "  ".join(f"{k}={v}" for k, v in self.votes.items())
-        conflict_tag = " ⚡CONFLICT" if self.conflict else ""
+        conflict_tag = " [CONFLICT]" if self.conflict else ""
         return (
             f"{self.ticker:<8} {self.action:<4} conf={self.confidence:.2f}"
             f"{conflict_tag}  [{votes_str}]"
@@ -113,7 +113,7 @@ class SignalReconciler:
         )
 
         if conflict:
-            log.info("Conflict on %s: %s → %s (conf=%.2f)", ticker, votes, action, confidence)
+            log.info("Conflict on %s: %s -> %s (conf=%.2f)", ticker, votes, action, confidence)
 
         return result
 

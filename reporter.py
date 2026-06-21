@@ -54,10 +54,10 @@ class Reporter:
                 row += f"  {cell:<6}"
             tag = ""
             if rec.conflict:
-                tag = " ⚡"
+                tag = " !"
                 conflicts += 1
             elif rec.action != "HOLD":
-                tag = " ✓"
+                tag = " [OK]"
             final_tag = f"{rec.action}{tag}"
             row += f"  {final_tag:<8}  {rec.confidence:.2f}"
             print(row)
@@ -123,7 +123,7 @@ class Reporter:
         print(f"  {'Time':<20}  {'Strat':<6}  {'Ticker':<8}  {'Action':<5}  {'Shares':>8}  {'Price':>8}  {'P&L':>10}")
         print("  " + "-" * 72)
         for t in trades:
-            pnl_str = f"+${t.pnl:.2f}" if t.pnl and t.pnl >= 0 else (f"-${abs(t.pnl):.2f}" if t.pnl else "   —")
+            pnl_str = f"+${t.pnl:.2f}" if t.pnl and t.pnl >= 0 else (f"-${abs(t.pnl):.2f}" if t.pnl else "   -")
             print(
                 f"  {t.executed_at[:19]:<20}  {t.strategy:<6}  {t.ticker:<8}  "
                 f"{t.action:<5}  {t.shares:>8.2f}  ${t.price:>7.2f}  {pnl_str:>10}"
@@ -172,7 +172,7 @@ class Reporter:
         print(f"  {'Strategy':<20}  {'Trades':>8}  {'Win Rate':>10}  {'P&L':>12}  {'Sharpe':>8}")
         print("  " + "-" * 68)
         for r in rows:
-            tag = "  ⭐ BEST" if r == rows[0] else ""
+            tag = "  [BEST]" if r == rows[0] else ""
             print(
                 f"  {r['strategy']:<20}  {r['trades']:>8}  "
                 f"{r['win_rate']:>9.1f}%  ${r['pnl']:>10.0f}  {r['sharpe']:>8.2f}{tag}"

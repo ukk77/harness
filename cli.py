@@ -1,23 +1,36 @@
 """Harness CLI — unified entry point for the trading platform.
 
-Jobs:
-    data_collection   — refresh sentiment + risk snapshots for all tickers
-                        Scheduled: 08:00, 11:00, 14:00, 17:00 ET
-    signal_generation — collect signals → reconcile → allocate → execute
-                        Scheduled: 08:30 – 17:30 ET, every hour
+ALL production commands run through this CLI. Individual strategy CLIs
+are for development/debugging only.
 
-Other commands:
+Scheduled jobs (cron / Task Scheduler):
+    data_collection   — refresh sentiment + risk snapshots (08:00/11:00/14:00/17:00 ET)
+    signal_generation — collect signals → reconcile → allocate → execute (hourly 08:30-17:30 ET)
+
+Orchestration:
     status            — health check all services, models, data
     report            — unified P&L + positions + strategy comparison
-    positions         — open positions across all strategy DBs
-    schedule          — register both Task Scheduler jobs (Windows)
+    positions         — open positions across all strategies
+    backtest          — compare all strategies on same historical period
+    logs              — tail/aggregate logs from all services
+    schedule          — register Task Scheduler jobs (Windows; use cron in cloud)
+
+Data & Models:
+    data              — trigger market data pipeline refresh (daily parquet cache)
+    train             — retrain all RL models
+    retrain-check     — check model degradation, retrain if needed
 
 Usage (from trading/ root):
     python -m harness.cli status
+    python -m harness.cli data [--interval 1d|1h|both] [--force-full]
     python -m harness.cli data_collection
     python -m harness.cli signal_generation [--dry-run] [--ticker AAPL]
+    python -m harness.cli train [--ticker AAPL] [--timesteps 100000]
+    python -m harness.cli retrain-check
     python -m harness.cli report
     python -m harness.cli positions
+    python -m harness.cli backtest [--days 365]
+    python -m harness.cli logs [--lines 100]
     python -m harness.cli schedule
 """
 from __future__ import annotations
@@ -86,6 +99,44 @@ def cmd_status(args) -> None:
     sys.exit(0 if report.ok else 1)
 
 
+# ── Ticker → Company name lookup (used by sentiment /api/analyze) ────────────
+_COMPANY_NAMES: dict = {
+    "AAPL": "Apple Inc.", "MSFT": "Microsoft Corporation", "TSLA": "Tesla Inc.",
+    "NVDA": "NVIDIA Corporation", "AMD": "Advanced Micro Devices", "AMZN": "Amazon.com Inc.",
+    "GOOGL": "Alphabet Inc.", "META": "Meta Platforms Inc.", "NFLX": "Netflix Inc.",
+    "UBER": "Uber Technologies", "PLTR": "Palantir Technologies", "ASML": "ASML Holding",
+    "AVGO": "Broadcom Inc.", "LITE": "Lumentum Holdings", "MU": "Micron Technology",
+    "NVTS": "Navitas Semiconductor", "SMCI": "Super Micro Computer",
+    "JPM": "JPMorgan Chase", "V": "Visa Inc.", "MA": "Mastercard Inc.",
+    "BRK.B": "Berkshire Hathaway", "XLF": "Financial Select Sector SPDR",
+    "GS": "Goldman Sachs", "MS": "Morgan Stanley", "BLK": "BlackRock Inc.",
+    "LLY": "Eli Lilly and Company", "UNH": "UnitedHealth Group", "JNJ": "Johnson & Johnson",
+    "MRK": "Merck & Co.", "XLV": "Health Care Select Sector SPDR",
+    "ABBV": "AbbVie Inc.", "GILD": "Gilead Sciences",
+    "CAT": "Caterpillar Inc.", "BA": "Boeing Company", "LMT": "Lockheed Martin",
+    "GE": "GE Aerospace", "NUE": "Nucor Corporation", "XLB": "Materials Select Sector SPDR",
+    "FCX": "Freeport-McMoRan", "MP": "MP Materials", "RTX": "RTX Corporation",
+    "XOM": "Exxon Mobil", "VST": "Vistra Corp", "GLD": "SPDR Gold Shares",
+    "XLE": "Energy Select Sector SPDR", "EQT": "EQT Corporation",
+    "KMI": "Kinder Morgan", "WMB": "Williams Companies",
+    "USAR": "US AR ETF", "UUUU": "Energy Fuels Inc.",
+    "COST": "Costco Wholesale", "HD": "Home Depot", "WMT": "Walmart Inc.",
+    "MCD": "McDonald's Corporation", "XLP": "Consumer Staples Select Sector SPDR",
+    "BABA": "Alibaba Group", "NB": "NioCorp Developments",
+    "COIN": "Coinbase Global", "MARA": "MARA Holdings", "MSTR": "MicroStrategy",
+    "SPY": "SPDR S&P 500 ETF", "QQQ": "Invesco QQQ Trust", "IWM": "iShares Russell 2000 ETF",
+    "TLT": "iShares 20+ Year Treasury Bond ETF", "SQQQ": "ProShares UltraPro Short QQQ",
+    "VIX": "CBOE Volatility Index", "XLU": "Utilities Select Sector SPDR",
+    "XLRE": "Real Estate Select Sector SPDR", "XLK": "Technology Select Sector SPDR",
+    "GEV": "GE Vernova",
+}
+
+
+def _company_name(ticker: str) -> str:
+    """Return company name for ticker, falling back to '<ticker> Inc.' if unknown."""
+    return _COMPANY_NAMES.get(ticker.upper(), f"{ticker} Inc.")
+
+
 # ── cmd_data_collection ───────────────────────────────────────────────────────
 
 def cmd_data_collection(args) -> None:
@@ -112,11 +163,23 @@ def cmd_data_collection(args) -> None:
         print(f"\r  {i:>3}/{len(tickers)}  [{pct:5.1f}%]  {ticker:<8}", end="", flush=True)
         try:
             import requests
-            resp = requests.post(
-                f"{cfg.sentiment_api_url}/api/analyze",
-                json={"ticker": ticker, "max_articles": 10},
-                timeout=30,
-            )
+            resp = None
+            last_error = None
+            for attempt in range(3):
+                try:
+                    resp = requests.post(
+                        f"{cfg.sentiment_api_url}/api/analyze",
+                        json={"ticker": ticker, "company_name": _company_name(ticker)},
+                        timeout=60,
+                    )
+                    last_error = None
+                    break
+                except requests.RequestException as e:
+                    last_error = e
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+            if last_error is not None:
+                raise last_error
             if resp.status_code == 200:
                 sent_ok += 1
                 log.debug("Sentiment OK: %s", ticker)
@@ -251,7 +314,7 @@ def cmd_signal_generation(args) -> None:
         from harness.paper_trading.db import HarnessTradingDB
         _db = HarnessTradingDB(cfg.paper_db_path)
         synced = _db.sync_from_alpaca(paper=(cfg.execution_mode != "live"))
-        print(f"  Synced {synced} position(s) from Alpaca → paper DB")
+        print(f"  Synced {synced} position(s) from Alpaca -> paper DB")
         log.info("Alpaca sync: %d positions loaded into paper DB", synced)
 
     if cfg.execution_mode == "live" and not dry_run:
@@ -420,6 +483,218 @@ def cmd_schedule(args) -> None:
     print("\n  Both jobs registered. View in Task Scheduler → Task Scheduler Library.\n")
 
 
+# ── Data command ─────────────────────────────────────────────────────────────
+
+def cmd_data(args) -> None:
+    """Trigger market data pipeline refresh (incremental parquet update)."""
+    log = _setup_logging("data")
+    import subprocess
+
+    interval = getattr(args, "interval", "both")
+    force_full = getattr(args, "force_full", False)
+    tickers = getattr(args, "tickers", None)
+
+    cmd = [sys.executable, "-m", "data_pipeline.data_ingestion",
+           "--interval", interval]
+    if force_full:
+        cmd.append("--force-full")
+    if tickers:
+        cmd += ["--tickers"] + tickers
+
+    print(f"  Running data pipeline — interval={interval} force={force_full}")
+    t0 = time.time()
+    result = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parents[1]))
+    elapsed = time.time() - t0
+    if result.returncode == 0:
+        print(f"  Data pipeline complete in {elapsed:.1f}s")
+        log.info("Data pipeline complete in %.1fs", elapsed)
+    else:
+        print(f"  Data pipeline FAILED (exit {result.returncode})")
+        log.error("Data pipeline failed with exit %d", result.returncode)
+
+
+# ── Train command ─────────────────────────────────────────────────────────────
+
+def cmd_train(args) -> None:
+    """Retrain RL models — all tickers or a single one."""
+    log = _setup_logging("train")
+    from rl_strategy.agent.train import train_single_ticker, train_all_tickers
+    from harness.config import get_config
+
+    ticker = getattr(args, "ticker", None)
+    timesteps = getattr(args, "timesteps", 100_000)
+    cfg = get_config()
+
+    if ticker:
+        tickers = [ticker.upper()]
+    else:
+        tickers = cfg._rl_tickers
+
+    print(f"  Training {len(tickers)} RL model(s) — {timesteps:,} timesteps each")
+    t0 = time.time()
+    for t in tickers:
+        print(f"    Training {t}...", end="", flush=True)
+        try:
+            train_single_ticker(t, timesteps=timesteps)
+            print(" done")
+            log.info("Trained %s", t)
+        except Exception as e:
+            print(f" FAILED: {e}")
+            log.error("Train failed for %s: %s", t, e)
+    print(f"  Training complete in {time.time()-t0:.1f}s")
+
+
+# ── Retrain-check command ─────────────────────────────────────────────────────
+
+def cmd_retrain_check(args) -> None:
+    """Check all RL models for performance degradation; retrain if needed."""
+    log = _setup_logging("retrain_check")
+    import json
+    from harness.config import get_config
+
+    cfg = get_config()
+    results_dir = Path(__file__).resolve().parents[1] / "results"
+    models_dir = Path(cfg.models_dir)
+    degradation_threshold = 0.15  # 15% P&L drop triggers retrain
+
+    needs_retrain = []
+    print(f"  Checking {len(cfg._rl_tickers)} RL models for degradation...")
+    for ticker in cfg._rl_tickers:
+        eval_file = results_dir / f"{ticker}_evaluation.json"
+        backtest_file = results_dir / f"{ticker}_backtest.json"
+        model_file = models_dir / f"{ticker}_ppo.zip"
+
+        if not model_file.exists():
+            print(f"    {ticker:<8} NO MODEL — will train")
+            needs_retrain.append(ticker)
+            continue
+
+        if not eval_file.exists() or not backtest_file.exists():
+            print(f"    {ticker:<8} NO EVAL DATA — skip")
+            continue
+
+        try:
+            eval_data = json.loads(eval_file.read_text())
+            bt_data = json.loads(backtest_file.read_text())
+            train_mean = eval_data.get("metrics", {}).get("mean_return", 0)
+            bt_mean = bt_data.get("trade_metrics", {}).get("mean_trade_pnl", 0)
+            # Simple heuristic: if latest backtest mean return is 15%+ below evaluation
+            ratio = (bt_mean / train_mean) if train_mean and abs(train_mean) > 0.01 else 1.0
+            degraded = ratio < (1 - degradation_threshold)
+            status = "DEGRADED" if degraded else "OK"
+            print(f"    {ticker:<8} {status}  train={train_mean:.4f} bt={bt_mean:.4f} ratio={ratio:.2f}")
+            if degraded:
+                needs_retrain.append(ticker)
+        except Exception as e:
+            print(f"    {ticker:<8} CHECK FAILED: {e}")
+
+    if needs_retrain:
+        print(f"\n  Retraining {len(needs_retrain)} model(s): {needs_retrain}")
+        from rl_strategy.agent.train import train_single_ticker
+        for t in needs_retrain:
+            print(f"    Retraining {t}...", end="", flush=True)
+            try:
+                train_single_ticker(t)
+                print(" done")
+                log.info("Retrained %s", t)
+            except Exception as e:
+                print(f" FAILED: {e}")
+                log.error("Retrain failed %s: %s", t, e)
+    else:
+        print("  All models healthy — no retraining needed.")
+
+
+# ── Logs command ──────────────────────────────────────────────────────────────
+
+def cmd_logs(args) -> None:
+    """Tail and aggregate recent log lines from all harness log files."""
+    lines = getattr(args, "lines", 50)
+    logs_dir = Path(__file__).resolve().parents[1] / "logs"
+
+    log_files = sorted(logs_dir.glob("*.log"), key=lambda f: f.stat().st_mtime, reverse=True)
+    if not log_files:
+        print("No log files found in logs/")
+        return
+
+    print(f"\n  Last {lines} lines per log file  ({len(log_files)} files)\n")
+    for lf in log_files[:6]:  # cap at 6 most recent files
+        print(f"  {'='*60}")
+        print(f"  {lf.name}")
+        print(f"  {'='*60}")
+        try:
+            content = lf.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in content[-lines:]:
+                print(f"  {line}")
+        except Exception as e:
+            print(f"  [error reading file: {e}]")
+        print()
+
+
+# ── Backtest command ─────────────────────────────────────────────────────────
+
+def cmd_backtest(args) -> None:
+    """Run per-strategy backtests and compare all reconciliation modes."""
+    log = _setup_logging("backtest")
+    from harness.backtest import HarnessBacktester
+
+    days = getattr(args, "days", 180)
+    strats = getattr(args, "strategy", None)
+    strats = [strats] if strats else None
+
+    _section(f"HARNESS BACKTEST — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  Period   : last {days} days")
+    print(f"  Capital  : $100,000")
+    print(f"  Strategies: {', '.join(strats or ['rl','mr','tf','vb']).upper()}")
+    print()
+
+    bt = HarnessBacktester(lookback_days=days)
+    t0 = time.time()
+    report = bt.run(strategies=strats)
+    elapsed = time.time() - t0
+
+    print()
+    print(f"{'='*90}")
+    print("STRATEGY COMPARISON")
+    print(f"{'='*90}")
+    print(f"  {'Strategy':<10} {'Sharpe':>7} {'Sortino':>8} {'CAGR%':>7} {'MaxDD%':>8} "
+          f"{'WinRate%':>10} {'P&L ($)':>11} {'Alpha%':>8} {'Trades':>8} {'Status'}")
+    print("  " + "-"*87)
+    for r in sorted(report.strategy_results, key=lambda x: x.sharpe, reverse=True):
+        star = " [*]" if r.strategy == report.best_strategy else ""
+        if r.error:
+            print(f"  {r.strategy.upper():<10} {'ERROR':>7}  {r.error[:50]}")
+        else:
+            alpha_str = f"{r.alpha:>+7.1f}" if r.alpha != 0.0 else f"{'N/A':>7}"
+            print(
+                f"  {r.strategy.upper():<10} {r.sharpe:>7.2f} {r.sortino:>8.2f} {r.cagr:>+7.1f} "
+                f"{r.max_drawdown:>8.1f} {r.win_rate:>10.1f} {r.pnl:>+11,.0f} {alpha_str} {r.num_trades:>8}{star}"
+            )
+    print()
+
+    if report.reconciliation_results:
+        print(f"{'='*72}")
+        print("RECONCILIATION MODE COMPARISON")
+        print(f"{'='*72}")
+        print(f"  {'Mode':<24} {'Acted':>6} {'Held':>6} {'Conflicts':>10} {'Consensus':>10} {'Est.Sharpe':>12}")
+        print("  " + "-"*65)
+        for r in sorted(report.reconciliation_results, key=lambda x: x.estimated_sharpe, reverse=True):
+            star = " [*]" if r.mode == report.best_recon_mode else ""
+            print(
+                f"  {r.mode:<24} {r.tickers_acted:>6} {r.tickers_held:>6} "
+                f"{r.conflicts_blocked:>10} {r.consensus_count:>10} {r.estimated_sharpe:>12.3f}{star}"
+            )
+        print()
+
+    print(f"{'='*72}")
+    print("RECOMMENDATION")
+    print(f"{'='*72}")
+    print(f"  {report.recommendation}")
+    print()
+    print(f"  Completed in {elapsed:.1f}s  |  Report saved to results/harness_backtest_*.json")
+    log.info("Backtest complete in %.1fs — best=%s recon=%s",
+             elapsed, report.best_strategy, report.best_recon_mode)
+
+
 # ── Argument parser ───────────────────────────────────────────────────────────
 
 def _parse_args():
@@ -430,6 +705,14 @@ def _parse_args():
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("status", help="Health check all services, models, and data")
+
+    p_data = sub.add_parser("data", help="Trigger market data pipeline refresh (parquet cache)")
+    p_data.add_argument("--interval", choices=["1d", "1h", "both"], default="both",
+                        help="Interval to update (default: both)")
+    p_data.add_argument("--force-full", action="store_true",
+                        help="Re-download full history instead of incremental")
+    p_data.add_argument("--tickers", nargs="+", default=None,
+                        help="Override ticker list")
 
     sub.add_parser("data_collection",
                    help="Collect sentiment + risk snapshots (runs at 08:00/11:00/14:00/17:00 ET)")
@@ -448,6 +731,23 @@ def _parse_args():
     sub.add_parser("positions", help="Show all open positions across all strategy DBs")
     sub.add_parser("schedule", help="Register Windows Task Scheduler jobs")
 
+    p_train = sub.add_parser("train", help="Retrain RL models (all tickers or one)")
+    p_train.add_argument("--ticker", default=None, help="Single ticker (default: all)")
+    p_train.add_argument("--timesteps", type=int, default=100_000,
+                         help="Training timesteps per model (default: 100000)")
+
+    sub.add_parser("retrain-check",
+                   help="Check all RL models for degradation, retrain if needed")
+
+    p_logs = sub.add_parser("logs", help="Tail recent log files from all services")
+    p_logs.add_argument("--lines", type=int, default=50,
+                        help="Lines per file to show (default: 50)")
+
+    p_bt = sub.add_parser("backtest", help="Run per-strategy backtests and compare reconciliation modes")
+    p_bt.add_argument("--days", type=int, default=180, help="Lookback period in days (default: 180)")
+    p_bt.add_argument("--strategy", choices=["rl", "mr", "tf", "vb"], default=None,
+                      help="Run only one strategy (default: all 4)")
+
     # Legacy alias: 'run' → signal_generation for backwards compatibility
     p_run = sub.add_parser("run", help="Alias for signal_generation")
     p_run.add_argument("--dry-run", action="store_true")
@@ -462,12 +762,17 @@ def main():
     args = _parse_args()
     dispatch = {
         "status": cmd_status,
+        "data": cmd_data,
         "data_collection": cmd_data_collection,
         "signal_generation": cmd_signal_generation,
         "run": cmd_signal_generation,   # legacy alias
         "report": cmd_report,
         "positions": cmd_positions,
         "schedule": cmd_schedule,
+        "backtest": cmd_backtest,
+        "train": cmd_train,
+        "retrain-check": cmd_retrain_check,
+        "logs": cmd_logs,
     }
     fn = dispatch.get(args.command)
     if fn:

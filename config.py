@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -72,18 +73,26 @@ class HarnessConfig:
 
     # ── Execution ────────────────────────────────────────────────────────────
     execution_mode: str = "paper"       # "paper" | "live"
-    paper_db_path: str = str(_TRADING_ROOT / "harness" / "harness_trades.db")
+    paper_db_path: str = field(default_factory=lambda: os.environ.get(
+        "HARNESS_DB_PATH", str(_TRADING_ROOT / "harness" / "harness_trades.db")))
 
-    # ── Services ─────────────────────────────────────────────────────────────
-    sentiment_api_url: str = "http://localhost:8000"
-    risk_api_url: str = "http://localhost:8100"
+    # ── Services — overridable via env vars for Docker/cloud ─────────────────
+    sentiment_api_url: str = field(default_factory=lambda: os.environ.get(
+        "SENTIMENT_API_URL", "http://localhost:8000"))
+    risk_api_url: str = field(default_factory=lambda: os.environ.get(
+        "RISK_API_URL", "http://localhost:8100"))
 
-    # ── Paths ────────────────────────────────────────────────────────────────
-    trading_root: str = str(_TRADING_ROOT)
-    models_dir: str = str(_TRADING_ROOT / "models")
-    market_data_dir: str = str(_TRADING_ROOT / "market_data" / "hourly")
-    results_dir: str = str(_TRADING_ROOT / "results")
-    logs_dir: str = str(_TRADING_ROOT / "logs")
+    # ── Paths — all overridable via env vars for Docker/cloud ─────────────────
+    trading_root: str = field(default_factory=lambda: os.environ.get(
+        "TRADING_ROOT", str(_TRADING_ROOT)))
+    models_dir: str = field(default_factory=lambda: os.environ.get(
+        "MODELS_DIR", str(_TRADING_ROOT / "models")))
+    market_data_dir: str = field(default_factory=lambda: os.environ.get(
+        "MARKET_DATA_DIR", str(_TRADING_ROOT / "market_data" / "hourly")))
+    results_dir: str = field(default_factory=lambda: os.environ.get(
+        "RESULTS_DIR", str(_TRADING_ROOT / "results")))
+    logs_dir: str = field(default_factory=lambda: os.environ.get(
+        "LOGS_DIR", str(_TRADING_ROOT / "logs")))
 
     # ── Risk controls ────────────────────────────────────────────────────────
     daily_loss_limit_pct: float = 0.02
