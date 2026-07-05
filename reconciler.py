@@ -28,6 +28,10 @@ class ReconciledSignal:
     confidence: float     # aggregate confidence
     price: float
     suggested_shares: Optional[float]
+    suggested_stop_pct: Optional[float]
+    expected_hold_days: Optional[int]
+    risk_bucket: Optional[str]
+    strategy_sources: List[str]
     votes: Dict[str, str]             # { "rl": "BUY", "mr": "SELL", ... }
     vote_confidences: Dict[str, float]
     mode_used: str
@@ -52,16 +56,39 @@ class SignalReconciler:
     def reconcile_all(
         self,
         signals_map: Dict[str, List[HarnessSignal]],
+        shadow_mode: Optional[str] = None
     ) -> Dict[str, ReconciledSignal]:
         """Reconcile signals for every ticker.
 
+        Args:
+            signals_map: { "AAPL": [HarnessSignal, ...], ... }
+            shadow_mode: If set, runs an alternative reconciliation logic in parallel
+                         and logs the divergence without affecting the main return.
         Returns:
             { "AAPL": ReconciledSignal, ... }
         """
-        return {
-            ticker: self.reconcile(signals)
-            for ticker, signals in signals_map.items()
-        }
+        results = {}
+        for ticker, signals in signals_map.items():
+            if not signals:
+                # No signals (e.g. circuit breaker halted trading) — skip gracefully
+                continue
+            primary_signal = self.reconcile(signals)
+            results[ticker] = primary_signal
+            
+            # A/B Testing Framework: Run shadow reconciliation
+            if shadow_mode:
+                # Temporarily swap mode
+                original_mode = self.cfg.reconciliation_mode
+                self.cfg.reconciliation_mode = shadow_mode
+                shadow_signal = self.reconcile(signals)
+                self.cfg.reconciliation_mode = original_mode
+                
+                # Log divergence
+                if primary_signal.action != shadow_signal.action:
+                    log.info("[A/B TEST] Divergence on %s: Primary(%s) -> %s vs Shadow(%s) -> %s",
+                             ticker, original_mode, primary_signal.action, shadow_mode, shadow_signal.action)
+                    
+        return results
 
     def reconcile(self, signals: List[HarnessSignal]) -> ReconciledSignal:
         """Reconcile a list of signals (one per strategy) for one ticker."""
@@ -92,6 +119,16 @@ class SignalReconciler:
 
         price = next((s.price for s in signals if s.price > 0), 0.0)
         shares = next((s.suggested_shares for s in signals if s.suggested_shares), None)
+        
+        # Extract stop and horizon metadata from the winning strategies (or all that agree with action)
+        winning_signals = [s for s in signals if s.action == action]
+        if not winning_signals:
+            winning_signals = signals
+            
+        suggested_stop = next((s.suggested_stop_pct for s in winning_signals if s.suggested_stop_pct is not None), None)
+        expected_hold = next((s.expected_hold_days for s in winning_signals if s.expected_hold_days is not None), None)
+        risk_bucket = next((s.risk_bucket for s in winning_signals if s.risk_bucket is not None), None)
+        strategy_sources = [s.source for s in winning_signals]
 
         vote_str = " | ".join(
             f"{s.source}={s.action}({s.confidence:.2f})" for s in signals
@@ -105,6 +142,10 @@ class SignalReconciler:
             confidence=confidence,
             price=price,
             suggested_shares=shares,
+            suggested_stop_pct=suggested_stop,
+            expected_hold_days=expected_hold,
+            risk_bucket=risk_bucket,
+            strategy_sources=strategy_sources,
             votes=votes,
             vote_confidences=vote_confs,
             mode_used=mode,

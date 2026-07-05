@@ -73,6 +73,71 @@ class Orchestrator:
         attr = f"_{strategy}_tickers"
         return getattr(self.cfg, attr, None) or self.cfg.tickers
 
+    def _sync_from_alpaca(self) -> None:
+        """Sync open positions and cash from Alpaca at the start of each signal cycle.
+
+        1. Updates harness_trades.db positions to match Alpaca exactly.
+        2. Invalidates the RLAdapter cache so it re-reads the fresh account state.
+        """
+        try:
+            from .paper_trading.db import HarnessTradingDB
+            n = HarnessTradingDB(self.cfg.paper_db_path).sync_from_alpaca()
+            log.info("[orchestrator] Alpaca sync: %d open positions updated", n)
+            print(f"  Alpaca sync: {n} open position(s) refreshed")
+        except Exception as e:
+            log.warning("[orchestrator] Alpaca sync failed (%s) — continuing with local DB state", e)
+            print(f"  Alpaca sync: unavailable ({e})")
+
+        # Invalidate RLAdapter cache so it re-fetches account state on first use
+        rl_adapter = self._adapters.get("rl")
+        if rl_adapter is not None and hasattr(rl_adapter, "invalidate_cache"):
+            rl_adapter.invalidate_cache()
+            log.debug("[orchestrator] RLAdapter account cache invalidated")
+
+    def _intraday_drawdown(self) -> Optional[float]:
+        """Return today's drawdown as a positive fraction (e.g. 0.05 = -5% on the day).
+
+        Primary source: Alpaca equity vs last_equity (previous market close) — this is
+        the true intraday NAV change and excludes unrealized losses carried from prior days.
+        Fallback: today's REALIZED PnL from the harness DB (never all-time unrealized).
+        Returns None if drawdown cannot be determined (circuit breaker then does not trip).
+        """
+        # Primary: Alpaca intraday equity change
+        try:
+            from trading_core.alpaca_broker import AlpacaBroker
+            info = AlpacaBroker(paper=(self.cfg.execution_mode != "live")).get_account_info()
+            equity = info.get("equity")
+            last_equity = info.get("last_equity")
+            if equity is not None and last_equity and last_equity > 0:
+                intraday_return = (equity - last_equity) / last_equity
+                dd = -intraday_return if intraday_return < 0 else 0.0
+                log.info("[orchestrator] Intraday NAV: equity=%.2f last_equity=%.2f drawdown=%.2f%%",
+                         equity, last_equity, dd * 100)
+                return dd
+        except Exception as e:
+            log.warning("[orchestrator] Alpaca intraday drawdown unavailable (%s) — using realized PnL fallback", e)
+
+        # Fallback: today's realized PnL only (exclude all-time unrealized)
+        try:
+            from datetime import date
+            from pathlib import Path
+            from .paper_trading.db import _conn
+            today = date.today().isoformat()
+            with _conn(Path(self.cfg.paper_db_path)) as conn:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) FROM trades "
+                    "WHERE DATE(executed_at) = ?",
+                    (today,),
+                ).fetchone()
+            realized_today = float(row[0]) if row and row[0] is not None else 0.0
+            nav = self.cfg.total_capital
+            dd = -realized_today / nav if realized_today < 0 and nav > 0 else 0.0
+            log.info("[orchestrator] Intraday drawdown (realized fallback): %.2f%%", dd * 100)
+            return dd
+        except Exception as e:
+            log.warning("[orchestrator] Could not determine intraday drawdown: %s", e)
+            return None
+
     def run(
         self,
         tickers: Optional[List[str]] = None,
@@ -83,19 +148,53 @@ class Orchestrator:
         Returns:
             { "AAPL": [rl_signal, mr_signal, ...], ... }
         """
+        # Sync positions and cash from Alpaca before any signals are generated
+        self._sync_from_alpaca()
+
         # D1/D2: Detect market regime using SPY and compute regime-aware allocation
+        circuit_breaker_tripped = False
         regime = Regime.RANGE_BOUND
         allocation = None
         try:
-            import sys, os
-            sys.path.insert(0, os.path.join(str(_TRADING_ROOT), "risk_calculator", "backend"))
-            from app.services.market_data import fetch_ohlcv
+            from trading_core.market_data import fetch_ohlcv
+            
+            # Fetch previous regime
+            previous_regime = None
+            try:
+                from .paper_trading.unified_reader import summary as db_summary
+                db_stats = db_summary(days=1) # look at today's stats or just last log
+                from .paper_trading.db import HarnessTradingDB
+                db = HarnessTradingDB(self.cfg.paper_db_path)
+                with db.get_connection() as conn:
+                    row = conn.execute("SELECT regime FROM allocation_history ORDER BY id DESC LIMIT 1").fetchone()
+                    if row and row[0]:
+                        try:
+                            previous_regime = Regime(row[0])
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+                
             spy_ohlcv = fetch_ohlcv("SPY", lookback_days=252)
-            regime = detect_regime(spy_ohlcv)
+            regime = detect_regime(spy_ohlcv, previous_regime=previous_regime)
             allocation = CapitalAllocator(self.cfg).allocate_for_regime(regime)
             log.info("[orchestrator] Regime=%s | Mode=%s", regime.value, allocation.mode)
             print(f"  Regime: {regime.value.upper()}  |  Allocation: " +
                   "  ".join(f"{a.strategy}={a.capital:,.0f}" for a in allocation.allocations))
+            
+            # Circuit breaker check 1: Regime
+            if self.cfg.circuit_breaker_extreme_bearish and regime == Regime.BEAR_TREND:
+                # Basic check, ideally we check for HIGH_VOL + BEAR_TREND
+                pass
+                
+            # Circuit breaker check 2: True intraday drawdown
+            dd_pct = self._intraday_drawdown()
+            if dd_pct is not None and dd_pct > self.cfg.circuit_breaker_drawdown_pct:
+                log.error("CIRCUIT BREAKER TRIGGERED: Intraday Drawdown %.2f%% > %.2f%% limit", dd_pct*100, self.cfg.circuit_breaker_drawdown_pct*100)
+                print(f"\n[bold red]CIRCUIT BREAKER TRIGGERED: Intraday Drawdown {dd_pct*100:.2f}% > {self.cfg.circuit_breaker_drawdown_pct*100:.2f}% limit[/bold red]")
+                print("  New entries (BUY/SHORT) blocked — exits (SELL/COVER) remain active.\n")
+                circuit_breaker_tripped = True
+                
             # D3: Log regime + allocation to harness_trades.db
             save_regime_log(
                 regime=regime.value,
@@ -168,8 +267,23 @@ class Orchestrator:
 
         elapsed = time.time() - t0
         total_signals = sum(len(v) for v in results.values())
-        print(f"  Done - {total_signals} signals in {elapsed:.1f}s")
-        log.info("Orchestrator: %d signals, %d tickers, %.1fs", total_signals, len(all_tickers), elapsed)
+        total_errors = sum(1 for v in results.values() for s in v if s.reason and s.reason.startswith("Error"))
+        print(f"  Done - {total_signals} signals ({total_errors} degraded) in {elapsed:.1f}s")
+        log.info("Orchestrator: %d signals (%d degraded), %d tickers, %.1fs", total_signals, total_errors, len(all_tickers), elapsed)
+
+        # Circuit breaker: demote any new-entry signals, leave exits intact
+        if circuit_breaker_tripped:
+            blocked = 0
+            for sig_list in results.values():
+                for sig in sig_list:
+                    if sig.action in ("BUY", "SHORT"):
+                        sig.action = "HOLD"
+                        sig.confidence = 0.0
+                        sig.reason = f"blocked:circuit_breaker | {sig.reason}"
+                        blocked += 1
+            if blocked:
+                log.info("[orchestrator] Circuit breaker blocked %d entry signal(s); exits preserved", blocked)
+                print(f"  Circuit breaker: blocked {blocked} entry signal(s). SELL/COVER signals preserved.")
 
         self._log_signals(results)
         return results

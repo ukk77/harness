@@ -7,11 +7,9 @@ from pathlib import Path
 
 from .base import BaseAdapter, HarnessSignal
 
-_TRADING_ROOT = Path(__file__).resolve().parents[3]
-_RISK_BACKEND = _TRADING_ROOT / "risk_calculator" / "backend"
-for _p in [str(_TRADING_ROOT), str(_RISK_BACKEND)]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_TRADING_ROOT = Path(__file__).resolve().parents[2]
+if str(_TRADING_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TRADING_ROOT))
 
 _ACTION_NORM = {
     "BUY": "BUY",
@@ -39,7 +37,7 @@ class TFAdapter(BaseAdapter):
 
     def _load_ohlcv(self, ticker: str):
         if ticker not in self._ohlcv_cache:
-            from app.services.market_data import fetch_ohlcv
+            from trading_core.market_data import fetch_ohlcv
             cfg = self._get_cfg()
             self._ohlcv_cache[ticker] = fetch_ohlcv(ticker, cfg.lookback_days)
         return self._ohlcv_cache[ticker]

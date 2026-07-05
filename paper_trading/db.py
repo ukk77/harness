@@ -47,6 +47,7 @@ def init_db(db_path: Optional[Path] = None) -> None:
                 shares          REAL    NOT NULL,
                 price           REAL    NOT NULL,
                 confidence      REAL,
+                realized_pnl    REAL    NOT NULL DEFAULT 0.0,
                 executed_at     TEXT    NOT NULL,
                 reconciled_from TEXT
             );
@@ -66,6 +67,12 @@ def init_db(db_path: Optional[Path] = None) -> None:
             CREATE INDEX IF NOT EXISTS idx_regime_log_date ON regime_log(logged_at);
         """)
         conn.commit()
+        # Migration: add realized_pnl column if it doesn't exist (for existing DBs)
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl REAL NOT NULL DEFAULT 0.0")
+            conn.commit()
+        except Exception:
+            pass
 
 
 def save_regime_log(
@@ -194,15 +201,16 @@ class HarnessTradingDB:
         shares: float,
         price: float,
         confidence: float = 0.0,
+        realized_pnl: float = 0.0,
         reconciled_from: Optional[Dict] = None,
     ) -> None:
         with _conn(self.db_path) as conn:
             conn.execute("""
                 INSERT INTO trades
-                    (ticker, strategy, action, shares, price, confidence, executed_at, reconciled_from)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (ticker, strategy, action, shares, price, confidence, realized_pnl, executed_at, reconciled_from)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                ticker, strategy, action, shares, price, confidence,
+                ticker, strategy, action, shares, price, confidence, realized_pnl,
                 datetime.utcnow().isoformat(),
                 json.dumps(reconciled_from) if reconciled_from else None,
             ))

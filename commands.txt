@@ -1,0 +1,453 @@
+================================================================================
+  TRADING PLATFORM COMMAND REFERENCE
+  Generated: 2026-07-04
+================================================================================
+
+This file lists every runnable command/script in the trading platform, grouped
+by layer.  Each entry shows the command's purpose and example usage.
+
+Most commands are meant to be run from the workspace root:
+  C:\Users\ukard\OneDrive\Desktop\trading\
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+
+1. Unified Harness CLI (production orchestration)
+2. Strategy CLIs (development/debugging only)
+3. Data Pipeline
+4. Daily / Scheduled Runners
+5. API Services (FastAPI)
+6. Maintenance & Utility Scripts
+7. Scheduler / PowerShell / Batch Wrappers
+
+================================================================================
+1. UNIFIED HARNESS CLI
+================================================================================
+
+Primary entry point: python -m harness.cli <command>
+
+status
+  Purpose: Health-check all services, models, market data, and strategy imports.
+  Usage:   python -m harness.cli status
+
+dashboard
+  Purpose: Unified dashboard showing health, Alpaca account, open positions,
+           recent trades, market-data freshness, RL model status, and regime.
+  Usage:   python -m harness.cli dashboard
+           python -m harness.cli dashboard --trade-limit 20
+           python -m harness.cli dashboard --health-timeout 2 --max-age-hours 25
+
+data
+  Purpose: Refresh the parquet market-data cache (1d, 1h, or both).
+  Usage:   python -m harness.cli data
+           python -m harness.cli data --interval 1h --force-full
+           python -m harness.cli data --tickers AAPL MSFT
+
+data_collection
+  Purpose: Collect sentiment + risk snapshots for every ticker in the union
+           universe.  Scheduled at 08:00/11:00/14:00/17:00 ET.
+  Usage:   python -m harness.cli data_collection
+
+signal_generation (alias: run)
+  Purpose: Collect signals from all 4 strategies, reconcile, allocate capital,
+           and execute paper trades.  Hourly market-hours job.
+  Usage:   python -m harness.cli signal_generation
+           python -m harness.cli signal_generation --dry-run
+           python -m harness.cli signal_generation --ticker AAPL
+           python -m harness.cli run --mode confidence_weighted
+
+report
+  Purpose: Print unified P&L, positions, and strategy comparison.
+  Usage:   python -m harness.cli report
+
+positions
+  Purpose: Show all open positions across every strategy DB.
+  Usage:   python -m harness.cli positions
+
+backtest
+  Purpose: Run per-strategy backtests and compare reconciliation modes.
+  Usage:   python -m harness.cli backtest
+           python -m harness.cli backtest --days 365 --strategy mr
+
+schedule
+  Purpose: Register Windows Task Scheduler jobs for the pipeline.
+  Usage:   python -m harness.cli schedule
+
+train
+  Purpose: Retrain RL models (single ticker or all configured RL tickers).
+  Usage:   python -m harness.cli train
+           python -m harness.cli train --ticker AAPL --timesteps 100000
+
+retrain-check
+  Purpose: Check RL models for rolling Sharpe degradation and optionally
+           auto-retrain degraded models.
+  Usage:   python -m harness.cli retrain-check
+           python -m harness.cli retrain-check --auto-retrain --retrain-timesteps 50000
+           python -m harness.cli retrain-check --min-sharpe 0.6 --ticker AAPL
+
+logs
+  Purpose: Tail recent log files from all services.
+  Usage:   python -m harness.cli logs
+           python -m harness.cli logs --lines 100
+
+comprehensive TICKERS...
+  Purpose: Auth-protected deep-dive analysis on tickers.
+  Usage:   python -m harness.cli comprehensive AAPL MSFT TSLA
+
+================================================================================
+2. STRATEGY CLIs (development / debugging only)
+================================================================================
+
+Production trading should go through `python -m harness.cli run`.
+The strategy CLIs are useful for debugging signals and backtests.
+
+--------------------------------------------------------------------------------
+2.1 Mean Reversion
+--------------------------------------------------------------------------------
+
+Module: mean_reversion.cli
+
+signals
+  Purpose: Generate current BUY/SELL/HOLD signals.
+  Usage:   mean_reversion\venv\Scripts\python.exe -m mean_reversion.cli signals
+           mean_reversion\venv\Scripts\python.exe -m mean_reversion.cli signals --ticker AAPL --json
+
+backtest
+  Purpose: Run historical backtest.
+  Usage:   mean_reversion\venv\Scripts\python.exe -m mean_reversion.cli backtest
+           mean_reversion\venv\Scripts\python.exe -m mean_reversion.cli backtest --ticker AAPL --start 2020-01-01
+           mean_reversion\venv\Scripts\python.exe -m mean_reversion.cli backtest --bb-period 20 --bb-std 2.0 --entry-zscore -2.0 --exit-zscore 0.0
+
+paper
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   mean_reversion\venv\Scripts\python.exe -m mean_reversion.cli paper
+
+positions
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   mean_reversion\venv\Scripts\python.exe -m mean_reversion.cli positions
+
+--------------------------------------------------------------------------------
+2.2 Trend Following
+--------------------------------------------------------------------------------
+
+Module: trend_following.cli
+
+signals
+  Purpose: Generate current BUY/SELL/HOLD signals.
+  Usage:   trend_following\venv\Scripts\python.exe -m trend_following.cli signals
+           trend_following\venv\Scripts\python.exe -m trend_following.cli signals --ticker AAPL --json
+
+backtest
+  Purpose: Run historical backtest.
+  Usage:   trend_following\venv\Scripts\python.exe -m trend_following.cli backtest
+           trend_following\venv\Scripts\python.exe -m trend_following.cli backtest --ticker AAPL --start 2024-01-01
+           trend_following\venv\Scripts\python.exe -m trend_following.cli backtest --fast 20 --slow 50 --ma-type EMA
+
+paper
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   trend_following\venv\Scripts\python.exe -m trend_following.cli paper
+
+positions
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   trend_following\venv\Scripts\python.exe -m trend_following.cli positions
+
+--------------------------------------------------------------------------------
+2.3 Volatility Breakout
+--------------------------------------------------------------------------------
+
+Module: volatility_breakout.cli
+
+signals
+  Purpose: Show current breakout signals.
+  Usage:   volatility_breakout\venv\Scripts\python.exe -m volatility_breakout.cli signals
+           volatility_breakout\venv\Scripts\python.exe -m volatility_breakout.cli signals --ticker AAPL
+
+backtest
+  Purpose: Run historical backtest.
+  Usage:   volatility_breakout\venv\Scripts\python.exe -m volatility_breakout.cli backtest
+           volatility_breakout\venv\Scripts\python.exe -m volatility_breakout.cli backtest --ticker AAPL --start 2024-01-01
+
+paper
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   volatility_breakout\venv\Scripts\python.exe -m volatility_breakout.cli paper
+
+positions
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   volatility_breakout\venv\Scripts\python.exe -m volatility_breakout.cli positions
+
+--------------------------------------------------------------------------------
+2.4 Reinforcement Learning (RL)
+--------------------------------------------------------------------------------
+
+Module: rl_strategy.cli
+
+signals
+  Purpose: Generate current signals from trained PPO models.
+  Usage:   python -m rl_strategy.cli signals --ticker AAPL
+           python -m rl_strategy.cli signals --all
+
+train
+  Purpose: Train a PPO agent for a single ticker or all tickers.
+  Usage:   python -m rl_strategy.cli train --ticker AAPL --timesteps 100000
+           python -m rl_strategy.cli train --all
+
+backtest
+  Purpose: Run episode-based backtest for a trained model.
+  Usage:   python -m rl_strategy.cli backtest --ticker AAPL --episodes 10
+
+paper
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   python -m rl_strategy.cli paper
+
+positions
+  Purpose: (Disabled) directs you to the unified harness.
+  Usage:   python -m rl_strategy.cli positions
+
+results
+  Purpose: View evaluation results.
+  Usage:   python -m rl_strategy.cli results
+           python -m rl_strategy.cli results --ticker AAPL
+
+versions
+  Purpose: List model versions in the registry.
+  Usage:   python -m rl_strategy.cli versions
+           python -m rl_strategy.cli versions --ticker AAPL
+
+rollback
+  Purpose: Roll back to a previous model version.
+  Usage:   python -m rl_strategy.cli rollback AAPL
+           python -m rl_strategy.cli rollback AAPL --version 20240101_120000
+
+tune
+  Purpose: Run hyperparameter grid search.
+  Usage:   python -m rl_strategy.cli tune --ticker AAPL --timesteps 30000
+
+retrain
+  Purpose: Check for model degradation (legacy P&L-based) and optionally retrain.
+  Usage:   python -m rl_strategy.cli retrain --ticker AAPL --auto
+           python -m rl_strategy.cli retrain --all --auto
+
+portfolio
+  Purpose: Show RL portfolio status with position limits.
+  Usage:   python -m rl_strategy.cli portfolio
+
+--------------------------------------------------------------------------------
+2.5 Risk Calculator CLI
+--------------------------------------------------------------------------------
+
+Module: risk_calculator.cli
+
+serve
+  Purpose: Launch the risk_calculator FastAPI server on port 8100.
+  Usage:   risk_calculator\venv\Scripts\python.exe risk_calculator\cli.py --serve
+           risk_calculator\venv\Scripts\python.exe risk_calculator\cli.py --serve --port 8100
+
+single-ticker report
+  Purpose: Generate a full risk report for a ticker (console + optional JSON).
+  Usage:   risk_calculator\venv\Scripts\python.exe risk_calculator\cli.py MSFT
+           risk_calculator\venv\Scripts\python.exe risk_calculator\cli.py NVDA --company "NVIDIA Corp" --output nvda.json
+           risk_calculator\venv\Scripts\python.exe risk_calculator\cli.py MSFT --dev-sentiment-file ../sentiment_analysis/msft_result.json
+
+================================================================================
+3. DATA PIPELINE
+================================================================================
+
+Module: data_pipeline.data_ingestion
+
+Purpose: Fetch and cache OHLCV market data from Polygon.io (with yfinance fallback)
+         into market_data/daily/ and market_data/hourly/ parquet files.
+
+Usage:   python -m data_pipeline.data_ingestion
+         python -m data_pipeline.data_ingestion --interval 1h
+         python -m data_pipeline.data_ingestion --interval both --force-full
+         python -m data_pipeline.data_ingestion --tickers AAPL MSFT --interval 1d
+
+================================================================================
+4. DAILY / SCHEDULED RUNNERS
+================================================================================
+
+run_daily_analysis.py
+  Purpose: Batch sentiment analysis for all tickers.  Writes to
+           daily_results/sentiment/ and sentiment_history.db.
+  Usage:   sentiment_analysis\venv\Scripts\python.exe run_daily_analysis.py
+           sentiment_analysis\venv\Scripts\python.exe run_daily_analysis.py --session postmarket
+
+run_daily_risk.py
+  Purpose: Batch risk reports for all tickers.  Writes to daily_results/risk/
+           and risk_history.db.
+  Usage:   risk_calculator\venv\Scripts\python.exe run_daily_risk.py
+           risk_calculator\venv\Scripts\python.exe run_daily_risk.py --session postmarket
+
+run_hourly.py
+  Purpose: Hourly intraday cron job.  Refreshes data and delegates the full
+           harness cycle (RL+MR+TF+VB, reconciled, unified paper trading).
+  Usage:   python run_hourly.py
+
+scheduler.py
+  Purpose: Python scheduler that runs run_hourly.py at :15 past each hour
+           from 08:15 to 16:15 ET.
+  Usage:   python scheduler.py
+
+run_paper_trading.py
+  Purpose: Legacy daily paper-trading runner for Trend Following.
+           Prefer `python -m harness.cli run`.
+  Usage:   trend_following\venv\Scripts\python.exe run_paper_trading.py
+           trend_following\venv\Scripts\python.exe run_paper_trading.py --force
+
+run_paper_trading_mr.py
+  Purpose: Legacy daily paper-trading runner for Mean Reversion.
+  Usage:   mean_reversion\venv\Scripts\python.exe run_paper_trading_mr.py
+           mean_reversion\venv\Scripts\python.exe run_paper_trading_mr.py --force
+
+run_paper_trading_vb.py
+  Purpose: Legacy daily paper-trading runner for Volatility Breakout.
+  Usage:   volatility_breakout\venv\Scripts\python.exe run_paper_trading_vb.py
+
+run_all_backtests.py
+  Purpose: Run backtests for MR, TF, and VB strategies in sequence.
+  Usage:   python run_all_backtests.py
+
+mean_reversion\run_backtest.py
+  Purpose: Standalone MR backtest runner.
+  Usage:   mean_reversion\venv\Scripts\python.exe mean_reversion\run_backtest.py
+           mean_reversion\venv\Scripts\python.exe mean_reversion\run_backtest.py --ticker AAPL --json-output
+           mean_reversion\venv\Scripts\python.exe mean_reversion\run_backtest.py --bb-period 20 --bb-std 2.0 --entry-zscore -2.0 --exit-zscore 0.0 --capital 100000
+
+trend_following\run_backtest.py
+  Purpose: Standalone TF backtest runner.
+  Usage:   trend_following\venv\Scripts\python.exe trend_following\run_backtest.py
+           trend_following\venv\Scripts\python.exe trend_following\run_backtest.py --ticker AAPL --json-output
+           trend_following\venv\Scripts\python.exe trend_following\run_backtest.py --fast 50 --slow 200 --ma-type EMA --capital 100000
+
+rl_strategy\run_all_backtests.py
+  Purpose: Backtest every trained *_ppo.zip model and print a summary.
+  Usage:   rl_strategy\venv\Scripts\python.exe rl_strategy\run_all_backtests.py
+
+rl_strategy\scheduler\hourly_job.py
+  Purpose: Legacy RL hourly scheduler.  Prefer the harness scheduler.
+  Usage:   rl_strategy\venv\Scripts\python.exe rl_strategy\scheduler\hourly_job.py
+           rl_strategy\venv\Scripts\python.exe rl_strategy\scheduler\hourly_job.py --schedule
+           rl_strategy\venv\Scripts\python.exe rl_strategy\scheduler\hourly_job.py --remove
+           rl_strategy\venv\Scripts\python.exe rl_strategy\scheduler\hourly_job.py --test
+
+================================================================================
+5. API SERVICES (FastAPI)
+================================================================================
+
+These services expose HTTP endpoints used by other components.  They are not
+run from a CLI directly; launch them with uvicorn (or via `python -m app.main
+from the backend directory).
+
+--------------------------------------------------------------------------------
+5.1 sentiment_analysis
+--------------------------------------------------------------------------------
+
+Launch:  cd sentiment_analysis\backend
+         sentiment_analysis\venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+Endpoints:
+  GET  /                 - Root / health info
+  GET  /api/health        - Service health check
+  POST /api/analyze        - Analyze sentiment for a ticker (used by risk + strategies)
+  POST /api/alerts         - Check sentiment alerts for a list of tickers
+  GET  /api/cache          - Sentiment cache statistics
+  DELETE /api/cache/{ticker} - Invalidate cache for a ticker
+  GET  /api/sources        - List available news sources
+  GET  /api/history/{ticker} - Historical sentiment snapshots (limit=90)
+  POST /api/comprehensive  - Deep-dive comprehensive analysis
+
+--------------------------------------------------------------------------------
+5.2 risk_calculator
+--------------------------------------------------------------------------------
+
+Launch:  cd risk_calculator
+         risk_calculator\venv\Scripts\python.exe -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8100
+
+Endpoints:
+  GET  /api/health         - Service health check (also checks sentiment upstream)
+  POST /api/risk            - Full risk report for a ticker (used by strategies)
+  POST /api/risk/portfolio  - Portfolio-level risk report (used by harness)
+  GET  /api/history/{ticker} - Historical risk snapshots (limit=90)
+
+================================================================================
+6. MAINTENANCE & UTILITY SCRIPTS
+================================================================================
+
+compute_correlations.py
+  Purpose: Long-term return correlation analysis across all strategy tickers.
+  Usage:   mean_reversion\venv\Scripts\python.exe compute_correlations.py
+           mean_reversion\venv\Scripts\python.exe compute_correlations.py --years 5 --high 0.75
+
+get_result_data.py
+  Purpose: Cross-service results summary from MR, TF, sentiment, and risk DBs.
+  Usage:   python get_result_data.py
+
+cleanup_orphaned_tf_positions.py
+  Purpose: One-time cleanup of MU/LLY/ASML positions that moved out of TF universe.
+  Usage:   python cleanup_orphaned_tf_positions.py
+
+clear_vb_lock.py
+  Purpose: Delete a specific VB run_log row (hard-coded date 2026-06-10).
+  Usage:   python clear_vb_lock.py
+
+clear_vb_lock_today.py
+  Purpose: Delete a specific VB run_log row (hard-coded date 2026-06-12).
+  Usage:   python clear_vb_lock_today.py
+
+update_configs.py
+  Purpose: Add tickers and sector mappings to strategy config files.
+  Usage:   python update_configs.py
+
+add_macd.py, fix_mr_obv.py, fix_tf_gen.py, fix_vb_cfg.py, fix_vb_gen.py
+  Purpose: One-time code/config patching scripts.  Review before re-running.
+  Usage:   python add_macd.py
+           python fix_mr_obv.py
+           python fix_tf_gen.py
+           python fix_vb_cfg.py
+           python fix_vb_gen.py
+
+================================================================================
+7. SCHEDULER / POWERSHELL / BATCH WRAPPERS
+================================================================================
+
+setup_scheduler.ps1
+  Purpose: Register 4 Windows Task Scheduler tasks:
+             08:00  TradingSentimentRisk_0800  (pre-market sentiment+risk)
+             11:00  TradingSentimentRisk_1100  (mid-morning refresh)
+             14:00  TradingSentimentRisk_1400  (afternoon refresh)
+             17:00  TradingDailyPipeline       (EOD: sentiment+risk + harness run)
+  Usage:   Run once from Administrator PowerShell:
+           .\setup_scheduler.ps1
+
+run_daily_all.ps1
+  Purpose: Full EOD pipeline wrapper: sentiment batch -> start API -> risk batch
+           -> harness run (all 4 strategies).
+  Usage:   .\run_daily_all.ps1
+
+run_sentiment_risk.ps1
+  Purpose: Intraday sentiment+risk refresh only (no paper trading).  Detects
+           market session from local time.
+  Usage:   .\run_sentiment_risk.ps1
+
+run_hourly_wrapper.ps1
+  Purpose: Market-hours guard that calls run_hourly.py Mon-Fri 09:15-16:00 ET.
+  Usage:   .\run_hourly_wrapper.ps1
+
+train_all.bat
+  Purpose: Batch-train 11 specific RL tickers (COIN, MSTR, JPM, V, BRK.B, LLY,
+           UNH, CAT, LMT, XOM, SPY) at 50k timesteps each.
+  Usage:   .\train_all.bat
+
+================================================================================
+NOTES
+================================================================================
+
+- Strategy-level paper trading CLIs (`paper`, `positions`) are intentionally
+  disabled; all production trading is routed through the harness.
+- Many scripts use venv-specific Python executes.  If a venv is missing, the
+  harness CLI generally falls back to the current `python` interpreter.
+- For API services, the harness CLI will auto-start them when needed (see
+  `_ensure_services_up` in harness/cli.py).
+
+================================================================================

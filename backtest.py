@@ -77,6 +77,7 @@ class HarnessBacktester:
         from harness.config import get_config
         self.cfg = get_config()
         self.capital = capital
+        self.lookback_days = lookback_days
         self.end_date   = datetime.today().strftime("%Y-%m-%d")
         self.start_date = (datetime.today() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
@@ -186,7 +187,7 @@ class HarnessBacktester:
             strategy="rl",
             tickers=tickers,
             total_return=avg_return_pct,
-            cagr=avg_return_pct / (180 / 365) if returns else 0.0,
+            cagr=avg_return_pct / (self.lookback_days / 365) if returns else 0.0,
             sharpe=_avg(sharpes),
             max_drawdown=_avg(drawdowns),
             win_rate=_avg(win_rates),

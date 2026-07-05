@@ -68,8 +68,12 @@ class SafetyGate:
             import zoneinfo
             et = zoneinfo.ZoneInfo("America/New_York")
         except ImportError:
-            from datetime import timezone as tz
-            et = timezone(timedelta(hours=-4))   # EDT fallback
+            try:
+                import pytz
+                et = pytz.timezone("America/New_York")
+            except ImportError:
+                from datetime import timezone as tz
+                et = timezone(timedelta(hours=-5))   # EST fallback (conservative: blocks 1h early in EDT, never allows pre-market)
 
         now_et = datetime.now(et)
         if now_et.weekday() >= 5:
@@ -97,13 +101,16 @@ class SafetyGate:
         try:
             with sqlite3.connect(str(db.db_path)) as conn:
                 row = conn.execute(
-                    "SELECT SUM(realized_pnl) FROM positions WHERE strategy='harness'"
+                    "SELECT SUM(realized_pnl) FROM trades "
+                    "WHERE strategy='harness' AND action='SELL' "
+                    "AND executed_at >= ?",
+                    (today,),
                 ).fetchone()
             total_realized = float(row[0] or 0.0)
             limit = -self.cfg.total_capital * self.cfg.daily_loss_limit_pct
             if total_realized < limit:
                 return False, (
-                    f"Daily loss limit hit: realized P&L ${total_realized:,.0f} "
+                    f"Daily loss limit hit: today's realized P&L ${total_realized:,.0f} "
                     f"< limit ${limit:,.0f}"
                 )
         except Exception:
@@ -129,11 +136,48 @@ class SafetyGate:
 
 
 class PaperExecutor:
-    """Records trades to harness_trades.db without hitting a real broker."""
+    """Records trades to harness_trades.db AND mirrors them to Alpaca paper trading account.
+
+    Local DB is always the source of truth; Alpaca submission is best-effort.
+    """
 
     def __init__(self, cfg: Optional[HarnessConfig] = None):
         self.cfg = cfg or get_config()
         self.db = HarnessTradingDB(self.cfg.paper_db_path)
+        self._broker = None
+        self._broker_unavailable = False  # set True on first init failure to avoid repeated attempts
+
+    def _get_broker(self):
+        """Lazy-init Alpaca paper broker; returns None if keys are missing."""
+        if self._broker_unavailable:
+            return None
+        if self._broker is None:
+            try:
+                from trading_core.alpaca_broker import AlpacaBroker
+                self._broker = AlpacaBroker(paper=True)
+                log.info("PaperExecutor: Alpaca paper broker initialised")
+            except Exception as e:
+                log.warning("PaperExecutor: Alpaca paper broker unavailable (%s) — local-only mode", e)
+                self._broker_unavailable = True
+        return self._broker
+
+    def _submit_to_alpaca(self, signal: ReconciledSignal, shares: float) -> None:
+        """Mirror the paper trade to Alpaca paper account. Errors are non-fatal."""
+        broker = self._get_broker()
+        if broker is None:
+            return
+        try:
+            side = "buy" if signal.action == "BUY" else "sell"
+            order = broker.submit_market_order(symbol=signal.ticker, qty=shares, side=side)
+            if order is not None:
+                log.info(
+                    "ALPACA-PAPER %s %s %.2f shares  order_id=%s",
+                    signal.action, signal.ticker, shares, getattr(order, "id", "?"),
+                )
+            else:
+                log.warning("ALPACA-PAPER %s %s returned None", signal.action, signal.ticker)
+        except Exception as e:
+            log.warning("ALPACA-PAPER submission failed for %s %s: %s", signal.action, signal.ticker, e)
 
     def execute(self, signal: ReconciledSignal, capital: float) -> bool:
         """Execute (paper) a reconciled signal.
@@ -185,9 +229,11 @@ class PaperExecutor:
                 shares=shares,
                 price=signal.price,
                 confidence=signal.confidence,
+                realized_pnl=0.0,
                 reconciled_from=signal.votes,
             )
             log.info("PAPER BUY  %s  %.2f shares @ $%.2f", signal.ticker, shares, signal.price)
+            self._submit_to_alpaca(signal, shares)
 
         elif signal.action == "SELL":
             if not position or (position.get("shares", 0) <= 0):
@@ -215,12 +261,14 @@ class PaperExecutor:
                 shares=sell_shares,
                 price=signal.price,
                 confidence=signal.confidence,
+                realized_pnl=realized_pnl,
                 reconciled_from=signal.votes,
             )
             log.info(
                 "PAPER SELL %s  %.2f shares @ $%.2f  P&L=$%.2f",
                 signal.ticker, sell_shares, signal.price, realized_pnl
             )
+            self._submit_to_alpaca(signal, sell_shares)
 
         return True
 
@@ -291,21 +339,89 @@ class AlpacaExecutor:
                 qty=shares,
                 side=side,
             )
+            if order is None:
+                log.error(
+                    "Alpaca order returned None (submission failed) for %s %s",
+                    signal.action, signal.ticker,
+                )
+                return False
+                
+            # Wait for fill
+            import time
+            filled_qty = 0.0
+            fill_price = signal.price
+            order_id_str = getattr(order, "id", "")
+            if order_id_str:
+                for _ in range(10):
+                    time.sleep(1)
+                    latest_order = broker.get_order(str(order_id_str))
+                    if latest_order:
+                        if latest_order.status == "filled":
+                            filled_qty = float(latest_order.filled_qty)
+                            fill_price = float(latest_order.filled_avg_price)
+                            break
+                        elif latest_order.status == "partially_filled":
+                            filled_qty = float(latest_order.filled_qty)
+                            fill_price = float(latest_order.filled_avg_price)
+                        elif latest_order.status in ("canceled", "rejected", "expired"):
+                            break
+            
+            if filled_qty == 0:
+                # If we couldn't track it or it didn't fill in 10s, log warning but fall back to requested
+                log.warning("Alpaca order %s for %s was not filled within 10s, assuming requested qty.", order_id_str, signal.ticker)
+                filled_qty = shares
+                
             log.info(
                 "ALPACA %s %s  %.2f shares @ ~$%.2f  order_id=%s",
-                signal.action, signal.ticker, shares, signal.price,
-                getattr(order, "id", "?"),
+                signal.action, signal.ticker, filled_qty, fill_price,
+                order_id_str,
             )
+            # Compute realized P&L for SELL (lookup cost basis from paper DB)
+            realized_pnl = 0.0
+            if signal.action == "SELL":
+                pos = self._db.get_position(signal.ticker, "harness")
+                if pos and pos.get("entry_price", 0) > 0:
+                    realized_pnl = (fill_price - pos["entry_price"]) * filled_qty
             # Record trade in paper DB for cooldown + daily loss tracking
             self._db.record_trade(
                 ticker=signal.ticker,
                 strategy="harness",
                 action=signal.action,
-                shares=shares,
-                price=signal.price,
+                shares=filled_qty,
+                price=fill_price,
                 confidence=signal.confidence,
+                realized_pnl=realized_pnl,
                 reconciled_from=signal.votes,
             )
+            
+            # Update position locally
+            if signal.action == "BUY":
+                self._db.update_position(
+                    ticker=signal.ticker,
+                    strategy="harness",
+                    shares=filled_qty,
+                    entry_price=fill_price,
+                    current_price=fill_price,
+                    unrealized_pnl=0.0,
+                    realized_pnl=0.0,
+                )
+            elif signal.action == "SELL":
+                pos = self._db.get_position(signal.ticker, "harness")
+                if pos:
+                    rem = pos["shares"] - filled_qty
+                    if rem <= 0:
+                        self._db.close_position(signal.ticker, "harness")
+                    else:
+                        self._db.update_position(
+                            ticker=signal.ticker,
+                            strategy="harness",
+                            shares=rem,
+                            entry_price=pos["entry_price"],
+                            current_price=fill_price,
+                            unrealized_pnl=(fill_price - pos["entry_price"]) * rem,
+                            realized_pnl=pos.get("realized_pnl", 0) + realized_pnl,
+                        )
+                        
             return True
         except Exception as e:
             log.error("Alpaca order failed for %s: %s", signal.ticker, e)

@@ -24,7 +24,7 @@ _DB_MAP: Dict[str, Path] = {
     "mr":      _TRADING_ROOT / "mean_reversion" / "mr_paper_trades.db",
     "tf":      _TRADING_ROOT / "trend_following" / "paper_trades.db",
     "vb":      _TRADING_ROOT / "volatility_breakout" / "paper_trading" / "vb_paper_trades.db",
-    "rl":      _TRADING_ROOT / "rl_paper_trades.db",
+    "rl":      _TRADING_ROOT / "rl_strategy" / "paper_trades.db",
 }
 
 
@@ -241,7 +241,7 @@ def get_all_trades(limit_per_db: int = 50) -> List[UnifiedTrade]:
     return results
 
 
-def summary() -> Dict[str, Any]:
+def summary(days: Optional[int] = None) -> Dict[str, Any]:
     """Return a dict summary of positions and P&L across all DBs."""
     positions = get_all_positions()
     open_count = len(positions)

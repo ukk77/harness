@@ -107,33 +107,51 @@ class CapitalAllocator:
         """Allocate capital proportional to each strategy's mean backtest Sharpe.
 
         Reads from results/*_backtest.json (RL) and results/*_evaluation.json.
-        Falls back to equal split if no results found.
+        Strategies with NO data receive an equal-floor weight rather than zero
+        (prevents a single strategy with data from claiming all capital).
+        Falls back to equal split if no strategy has data.
         """
-        sharpes: Dict[str, float] = {}
+        sharpes: Dict[str, Optional[float]] = {}
         for strategy in self.cfg.strategies:
             sharpes[strategy] = self._mean_sharpe(strategy)
 
-        total_sharpe = sum(max(s, 0) for s in sharpes.values())
+        has_data = [s for s, v in sharpes.items() if v is not None]
+        no_data  = [s for s, v in sharpes.items() if v is None]
 
-        if total_sharpe == 0:
-            log.warning("No Sharpe data found; falling back to equal split")
+        if not has_data:
+            log.warning("No Sharpe data found for any strategy; falling back to equal split")
             return self._equal_split()
+
+        # No-data strategies each receive an equal-floor weight (1/n).
+        # Data strategies compete Sharpe-weighted for the remaining pool.
+        n = len(self.cfg.strategies)
+        equal_weight  = 1.0 / n
+        floor_total   = len(no_data) * equal_weight
+        remaining     = 1.0 - floor_total   # weight pool for data strategies
+
+        total_sharpe = sum(max(sharpes[s], 0) for s in has_data)
 
         allocations = []
         for strategy in self.cfg.strategies:
-            s = max(sharpes.get(strategy, 0), 0)
-            weight = s / total_sharpe
-            # Enforce max_strategy_pct cap
-            weight = min(weight, self.cfg.max_strategy_pct)
-            capital = self.cfg.total_capital * weight
-            allocations.append(StrategyAllocation(strategy, capital, weight, sharpes[strategy]))
+            if strategy in no_data:
+                weight = equal_weight
+            elif total_sharpe > 0:
+                weight = (max(sharpes[strategy], 0) / total_sharpe) * remaining
+            else:
+                # All data strategies have <= 0 Sharpe; split remaining equally
+                weight = remaining / len(has_data)
 
-        # Re-normalise after capping
-        total_alloc = sum(a.capital for a in allocations)
-        if total_alloc > 0:
-            for a in allocations:
-                a.capital = (a.capital / total_alloc) * self.cfg.total_capital
-                a.weight = a.capital / self.cfg.total_capital
+            weight = min(weight, self.cfg.max_strategy_pct)
+            allocations.append(StrategyAllocation(
+                strategy, self.cfg.total_capital * weight, weight, sharpes[strategy]
+            ))
+
+        # Re-normalise to ensure weights always sum to 1.0 after cap enforcement
+        total_w = sum(a.weight for a in allocations)
+        for a in allocations:
+            if total_w > 0:
+                a.weight = a.weight / total_w
+            a.capital = self.cfg.total_capital * a.weight
 
         return AllocationResult(self.cfg.total_capital, allocations, "sharpe_weighted")
 
@@ -183,45 +201,64 @@ class CapitalAllocator:
             mode=f"regime:{regime.value}",
         )
 
-    def _mean_sharpe(self, strategy: str) -> float:
-        """Read mean Sharpe from result JSON files for the given strategy."""
+    def _mean_sharpe(self, strategy: str) -> Optional[float]:
+        """Read mean Sharpe from result JSON files. Returns None if no data available."""
         results_dir = Path(self.cfg.results_dir)
-        if not results_dir.exists():
-            return 0.0
-
+        bt_sharpe = 0.0
+        live_sharpe = 0.0
+        
+        # 1. Backtest Sharpe
         sharpes = []
-
-        if strategy == "rl":
-            for f in results_dir.glob("*_backtest.json"):
-                try:
-                    data = json.loads(f.read_text())
-                    s = data.get("episode_metrics", {}).get("mean_sharpe")
-                    if s is not None:
-                        sharpes.append(float(s))
-                except Exception:
-                    pass
-
-        elif strategy in ("mr", "tf", "vb"):
-            prefix = {"mr": "mr", "tf": "tf", "vb": "vb"}.get(strategy, strategy)
-            for f in results_dir.glob(f"{prefix}_*.json"):
-                try:
-                    data = json.loads(f.read_text())
-                    s = data.get("sharpe_ratio") or data.get("sharpe")
-                    if s is not None:
-                        sharpes.append(float(s))
-                except Exception:
-                    pass
-
-            # Fallback: per-ticker evaluation files named {TICKER}_evaluation.json
-            if not sharpes:
-                for f in results_dir.glob("*_evaluation.json"):
+        if results_dir.exists():
+            if strategy == "rl":
+                for f in results_dir.glob("*_backtest.json"):
                     try:
                         data = json.loads(f.read_text())
-                        if data.get("strategy") == strategy:
-                            s = data.get("metrics", {}).get("sharpe")
-                            if s is not None:
-                                sharpes.append(float(s))
+                        s = data.get("episode_metrics", {}).get("mean_sharpe")
+                        if s is not None:
+                            sharpes.append(float(s))
                     except Exception:
                         pass
 
-        return float(sum(sharpes) / len(sharpes)) if sharpes else 0.0
+            elif strategy in ("mr", "tf", "vb"):
+                prefix = {"mr": "mr", "tf": "tf", "vb": "vb"}.get(strategy, strategy)
+                for f in results_dir.glob(f"{prefix}_*.json"):
+                    try:
+                        data = json.loads(f.read_text())
+                        s = data.get("sharpe_ratio") or data.get("sharpe")
+                        if s is not None:
+                            sharpes.append(float(s))
+                    except Exception:
+                        pass
+
+                # Fallback: per-ticker evaluation files named {TICKER}_evaluation.json
+                if not sharpes:
+                    for f in results_dir.glob("*_evaluation.json"):
+                        try:
+                            data = json.loads(f.read_text())
+                            if data.get("strategy") == strategy:
+                                s = data.get("metrics", {}).get("sharpe")
+                                if s is not None:
+                                    sharpes.append(float(s))
+                        except Exception:
+                            pass
+                            
+        if not sharpes:
+            return None  # No backtest data — caller treats as equal-floor
+
+        bt_sharpe = float(sum(sharpes) / len(sharpes))
+
+        # 2. Live Sharpe (from DB over last 30 days)
+        live_sharpe = bt_sharpe
+        try:
+            from .paper_trading.unified_reader import summary as db_summary
+            db_stats = db_summary(days=30)
+            strat_stats = db_stats.get("by_strategy", {}).get(strategy, {})
+            win_rate = strat_stats.get("win_rate", 0.0)
+            if win_rate > 0:
+                live_sharpe = max((win_rate - 0.5) * 4.0, 0)
+        except Exception as e:
+            log.warning("Could not calculate live Sharpe for %s: %s", strategy, e)
+
+        # Blend 70% backtest, 30% live
+        return (0.7 * bt_sharpe) + (0.3 * live_sharpe)

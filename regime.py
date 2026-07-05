@@ -57,7 +57,7 @@ def _realised_vol_ann(close: pd.Series, window: int = 20) -> Optional[float]:
     return float(rets.tail(window).std() * np.sqrt(252))
 
 
-def detect_regime(ohlcv: pd.DataFrame) -> Regime:
+def detect_regime(ohlcv: pd.DataFrame, previous_regime: Optional[Regime] = None) -> Regime:
     """Classify the current market regime from a daily OHLCV DataFrame.
 
     Args:
@@ -65,6 +65,7 @@ def detect_regime(ohlcv: pd.DataFrame) -> Regime:
                (case-insensitive — accepts both TitleCase and lowercase).
                Index must be datetime-like and sorted ascending.
                Minimum 200 rows recommended for reliable 200-SMA.
+        previous_regime: The regime identified in the previous run (for hysteresis).
 
     Returns:
         Regime enum value.
@@ -82,7 +83,8 @@ def detect_regime(ohlcv: pd.DataFrame) -> Regime:
 
     # 1. Realised vol check (highest priority — elevated vol overrides trend calls)
     rv = _realised_vol_ann(close, window=20)
-    if rv is not None and rv > 0.30:
+    hv_threshold = 0.28 if previous_regime == Regime.HIGH_VOL else 0.30
+    if rv is not None and rv > hv_threshold:
         return Regime.HIGH_VOL
 
     # 2. 200-SMA trend filter
@@ -93,7 +95,10 @@ def detect_regime(ohlcv: pd.DataFrame) -> Regime:
     # 3. ADX trend strength
     adx_series = _adx(high, low, close)
     adx_val = float(adx_series.iloc[-1]) if len(adx_series) > 0 else 0.0
-    trending = adx_val > 25
+    
+    is_trend_prev = previous_regime in (Regime.BULL_TREND, Regime.BEAR_TREND)
+    trend_threshold = 20 if is_trend_prev else 25
+    trending = adx_val > trend_threshold
 
     # 4. Momentum (20-day return)
     momentum = float(close.pct_change(20).iloc[-1]) if len(close) >= 21 else 0.0

@@ -18,6 +18,9 @@ class HarnessSignal:
     price: float
     suggested_shares: Optional[float] = None
     reason: Optional[str] = None
+    suggested_stop_pct: Optional[float] = None
+    expected_hold_days: Optional[int] = None
+    risk_bucket: Optional[str] = None
 
     def __str__(self) -> str:
         shares_str = f"{self.suggested_shares:.2f}sh" if self.suggested_shares else "N/A"

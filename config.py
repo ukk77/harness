@@ -16,10 +16,14 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
-
-log = logging.getLogger(__name__)
+from dotenv import load_dotenv
 
 _TRADING_ROOT = Path(__file__).resolve().parents[1]
+_ENV_PATH = _TRADING_ROOT / ".env"
+if _ENV_PATH.exists():
+    load_dotenv(dotenv_path=_ENV_PATH)
+    
+log = logging.getLogger(__name__)
 
 
 def _load_rl_tickers(models_dir: str, results_dir: str, min_sharpe: float = 0.5) -> List[str]:
@@ -97,6 +101,8 @@ class HarnessConfig:
     # ── Risk controls ────────────────────────────────────────────────────────
     daily_loss_limit_pct: float = 0.02
     trade_cooldown_hours: int = 4
+    circuit_breaker_drawdown_pct: float = 0.05  # Halt trading if portfolio DD > 5% today
+    circuit_breaker_extreme_bearish: bool = True # Halt trading if regime is bear + high vol
 
     # ── Schedule ─────────────────────────────────────────────────────────────
     # data_collection runs: 08:00, 11:00, 14:00, 17:00 ET

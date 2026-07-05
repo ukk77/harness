@@ -58,6 +58,18 @@ class Reporter:
                 conflicts += 1
             elif rec.action != "HOLD":
                 tag = " [OK]"
+            elif rec.action == "HOLD" and rec.confidence == 0.0:
+                # Check if it was an error
+                is_degraded = False
+                if any(v.startswith("Error") for v in rec.votes.values()):
+                    is_degraded = True
+                elif raw_signals:
+                    # Check raw signals for Error
+                    if any(sig.reason is not None and "Error" in sig.reason for signals in raw_signals.values() for sig in signals if sig.ticker == ticker and sig.source in rec.votes):
+                        is_degraded = True
+                
+                if is_degraded:
+                    tag = " [DEGRADED]"
             final_tag = f"{rec.action}{tag}"
             row += f"  {final_tag:<8}  {rec.confidence:.2f}"
             print(row)
@@ -137,31 +149,52 @@ class Reporter:
         rows = []
 
         if results_dir.exists():
-            sharpes = []
-            returns = []
-            win_rates = []
-            trade_counts = []
-            for f in sorted(results_dir.glob("*_backtest.json")):
+            # Prefer the latest harness_backtest_*.json which contains all 4 strategies
+            harness_files = sorted(results_dir.glob("harness_backtest_*.json"), reverse=True)
+            if harness_files:
                 try:
-                    data = json.loads(f.read_text())
-                    em = data.get("episode_metrics", {})
-                    sharpes.append(em.get("mean_sharpe", 0.0))
-                    returns.append(em.get("mean_return", 0.0))
-                    win_rates.append(data.get("trade_metrics", {}).get("win_rate", 0.0) * 100)
-                    trade_counts.append(data.get("total_trades", 0))
+                    data = json.loads(harness_files[0].read_text())
+                    for s in data.get("strategies", []):
+                        if s.get("error"):
+                            continue
+                        rows.append({
+                            "strategy": s["strategy"],
+                            "trades": s.get("num_trades", 0),
+                            "win_rate": s.get("win_rate_pct", 0.0),
+                            "pnl": s.get("total_return_pct", 0.0),
+                            "sharpe": s.get("sharpe", 0.0),
+                        })
                 except Exception:
                     pass
-            if sharpes:
-                rows.append({
-                    "strategy": "rl_strategy",
-                    "trades": sum(trade_counts),
-                    "win_rate": sum(win_rates) / len(win_rates) if win_rates else 0,
-                    "pnl": sum(returns),
-                    "sharpe": sum(sharpes) / len(sharpes),
-                })
+
+            # Fall back to RL per-ticker backtest files if no harness backtest exists
+            if not rows:
+                sharpes, returns, win_rates, trade_counts = [], [], [], []
+                for f in sorted(results_dir.glob("*_backtest.json")):
+                    if f.name.startswith("harness_"):
+                        continue
+                    try:
+                        data = json.loads(f.read_text())
+                        em = data.get("episode_metrics", {})
+                        s = em.get("mean_sharpe")
+                        if s is not None:
+                            sharpes.append(float(s))
+                            returns.append(em.get("mean_return", 0.0))
+                            win_rates.append(data.get("trade_metrics", {}).get("win_rate", 0.0) * 100)
+                            trade_counts.append(data.get("total_trades", 0))
+                    except Exception:
+                        pass
+                if sharpes:
+                    rows.append({
+                        "strategy": "rl",
+                        "trades": sum(trade_counts),
+                        "win_rate": sum(win_rates) / len(win_rates) if win_rates else 0,
+                        "pnl": sum(returns),
+                        "sharpe": sum(sharpes) / len(sharpes),
+                    })
 
         if not rows:
-            print("\n  No strategy comparison data available yet.\n")
+            print("\n  No strategy comparison data available yet. Run: harness backtest\n")
             return
 
         rows.sort(key=lambda r: r["sharpe"], reverse=True)
@@ -169,13 +202,13 @@ class Reporter:
         print(f"\n{'='*72}")
         print("STRATEGY COMPARISON (backtest results)")
         print(f"{'='*72}\n")
-        print(f"  {'Strategy':<20}  {'Trades':>8}  {'Win Rate':>10}  {'P&L':>12}  {'Sharpe':>8}")
+        print(f"  {'Strategy':<20}  {'Trades':>8}  {'Win Rate':>10}  {'Return%':>10}  {'Sharpe':>8}")
         print("  " + "-" * 68)
         for r in rows:
             tag = "  [BEST]" if r == rows[0] else ""
             print(
                 f"  {r['strategy']:<20}  {r['trades']:>8}  "
-                f"{r['win_rate']:>9.1f}%  ${r['pnl']:>10.0f}  {r['sharpe']:>8.2f}{tag}"
+                f"{r['win_rate']:>9.1f}%  {r['pnl']:>+9.1f}%  {r['sharpe']:>8.2f}{tag}"
             )
         print()
 

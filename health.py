@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -49,8 +49,9 @@ class HealthReport:
 class HealthChecker:
     """Validates all harness dependencies before running."""
 
-    def __init__(self, cfg: Optional[HarnessConfig] = None):
+    def __init__(self, cfg: Optional[HarnessConfig] = None, request_timeout: float = 15.0):
         self.cfg = cfg or get_config()
+        self.request_timeout = request_timeout
 
     def run(self) -> HealthReport:
         report = HealthReport()
@@ -65,19 +66,54 @@ class HealthChecker:
     def _check_apis(self) -> List[HealthResult]:
         results = []
         for name, url in [
-            ("sentiment_analysis", f"{self.cfg.sentiment_api_url}/api/health"),
-            ("risk_calculator", f"{self.cfg.risk_api_url}/api/health"),
+            ("sentiment_analysis", f"{self.cfg.sentiment_api_url}"),
+            ("risk_calculator", f"{self.cfg.risk_api_url}"),
         ]:
             t0 = time.time()
             try:
-                resp = requests.get(url, timeout=15)
+                # 1. Check reachability
+                health_url = f"{url}/api/health"
+                resp = requests.get(health_url, timeout=self.request_timeout)
                 latency = (time.time() - t0) * 1000
                 if resp.status_code == 200:
-                    results.append(HealthResult(name, "OK", f"UP ({latency:.0f}ms)", latency))
+                    results.append(HealthResult(f"{name}_api", "OK", f"UP ({latency:.0f}ms)", latency))
                 else:
-                    results.append(HealthResult(name, "WARN", f"HTTP {resp.status_code}", latency))
+                    results.append(HealthResult(f"{name}_api", "WARN", f"HTTP {resp.status_code}", latency))
+                    continue
+                
+                # 2. Check data freshness on a benchmark ticker
+                bench = "SPY"
+                hist_url = f"{url}/api/history/{bench}?limit=1"
+                resp = requests.get(hist_url, timeout=min(self.request_timeout, 5.0))
+                if resp.status_code == 200:
+                    data = resp.json()
+                    snapshots = data.get("snapshots", [])
+                    if snapshots:
+                        latest = snapshots[0]
+                        # Risk calculator uses "as_of", sentiment uses "captured_at" or "as_of"
+                        captured_at_str = latest.get("captured_at") or latest.get("as_of")
+                        if captured_at_str:
+                            try:
+                                # Parse ISO format, handle Z
+                                if captured_at_str.endswith("Z"):
+                                    captured_at_str = captured_at_str[:-1] + "+00:00"
+                                captured_at = datetime.fromisoformat(captured_at_str)
+                                age_hours = (datetime.now(captured_at.tzinfo) - captured_at).total_seconds() / 3600
+                                if age_hours > 4:
+                                    results.append(HealthResult(f"{name}_freshness", "WARN", f"Stale data: {age_hours:.1f}h old for {bench}"))
+                                else:
+                                    results.append(HealthResult(f"{name}_freshness", "OK", f"Fresh: {age_hours:.1f}h old"))
+                            except Exception as e:
+                                results.append(HealthResult(f"{name}_freshness", "WARN", f"Could not parse timestamp: {e}"))
+                        else:
+                            results.append(HealthResult(f"{name}_freshness", "WARN", "No timestamp found in snapshot"))
+                    else:
+                        results.append(HealthResult(f"{name}_freshness", "WARN", f"No history found for {bench}"))
+                else:
+                    results.append(HealthResult(f"{name}_freshness", "WARN", f"History API HTTP {resp.status_code}"))
+                    
             except Exception as e:
-                results.append(HealthResult(name, "WARN", f"Unreachable: {e}"))
+                results.append(HealthResult(f"{name}_api", "FAIL", f"Unreachable: {type(e).__name__}"))
         return results
 
     # ── Model file checks ─────────────────────────────────────────────────────
@@ -125,22 +161,38 @@ class HealthChecker:
             results.append(HealthResult("market_data", "FAIL", "No parquet files found"))
             return results
 
-        cutoff = datetime.now() - timedelta(hours=25)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=25)
         stale = []
+        missing_freshness = []
         for f in parquet_files:
-            mtime = datetime.fromtimestamp(f.stat().st_mtime)
-            if mtime < cutoff:
-                stale.append(f.stem)
+            freshness_file = f.with_suffix(".freshness")
+            if freshness_file.exists():
+                try:
+                    ts_str = freshness_file.read_text().strip()
+                    if ts_str.endswith("Z"):
+                        ts_str = ts_str[:-1] + "+00:00"
+                    last_update = datetime.fromisoformat(ts_str)
+                    if last_update < cutoff:
+                        stale.append(f.stem)
+                except Exception:
+                    missing_freshness.append(f.stem)
+            else:
+                missing_freshness.append(f.stem)
 
-        if not stale:
+        if not stale and not missing_freshness:
             results.append(HealthResult(
                 "market_data", "OK",
                 f"{len(parquet_files)} files, all fresh"
             ))
         else:
+            err_msg = ""
+            if stale:
+                err_msg += f"{len(stale)}/{len(parquet_files)} files stale (>25h): {', '.join(stale[:5])}. "
+            if missing_freshness:
+                err_msg += f"{len(missing_freshness)} files missing freshness metadata."
             results.append(HealthResult(
                 "market_data", "WARN",
-                f"{len(stale)}/{len(parquet_files)} files stale (>25h): {', '.join(stale[:5])}"
+                err_msg.strip()
             ))
         return results
 
