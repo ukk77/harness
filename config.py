@@ -104,6 +104,12 @@ class HarnessConfig:
     circuit_breaker_drawdown_pct: float = 0.05  # Halt trading if portfolio DD > 5% today
     circuit_breaker_extreme_bearish: bool = True # Halt trading if regime is bear + high vol
 
+    # ── Regime detection (Phase 4, A4) ──────────────────────────────────────
+    regime_mode: str = "model"            # "model" (learned XGBoost classifier) | "heuristic" (fallback)
+    regime_soft_blend: bool = False       # If True, allocator blends _REGIME_MULTIPLIERS by predict_proba
+    regime_model_path: str = field(default_factory=lambda: os.environ.get(
+        "REGIME_MODEL_PATH", str(_TRADING_ROOT / "models" / "regime_xgb.json")))
+
     # ── Schedule ─────────────────────────────────────────────────────────────
     # data_collection runs: 08:00, 11:00, 14:00, 17:00 ET
     data_collection_times: List[str] = field(

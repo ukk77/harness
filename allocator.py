@@ -155,17 +155,37 @@ class CapitalAllocator:
 
         return AllocationResult(self.cfg.total_capital, allocations, "sharpe_weighted")
 
-    def allocate_for_regime(self, regime: Regime) -> AllocationResult:
+    def allocate_for_regime(
+        self,
+        regime: Regime,
+        regime_probs: Optional[Dict[Regime, float]] = None,
+    ) -> AllocationResult:
         """Sharpe-weighted allocation scaled by regime-specific multipliers.
 
         1. Compute base Sharpe-weighted allocation.
-        2. Apply _REGIME_MULTIPLIERS for the current regime.
+        2. Apply _REGIME_MULTIPLIERS for the current regime (hard pick) — OR,
+           if `cfg.regime_soft_blend` is True AND `regime_probs` is provided
+           (Phase 4 A4, learned classifier probabilities), blend
+           _REGIME_MULTIPLIERS across all regimes weighted by probability.
+           Default behaviour (regime_probs=None) is completely unchanged.
         3. Re-normalise weights to 1.0, enforce max_strategy_pct cap.
 
-        Returns an AllocationResult with mode set to "regime:<regime_value>".
+        Returns an AllocationResult with mode set to "regime:<regime_value>"
+        (or "regime_soft:<regime_value>" when soft-blending is active).
         """
         base = self._sharpe_weighted()
-        multipliers = _REGIME_MULTIPLIERS.get(regime, {})
+        soft_blend_active = bool(self.cfg.regime_soft_blend) and regime_probs
+
+        if soft_blend_active:
+            multipliers: Dict[str, float] = {}
+            for strategy in self.cfg.strategies:
+                blended = sum(
+                    prob * _REGIME_MULTIPLIERS.get(r, {}).get(strategy, 1.0)
+                    for r, prob in regime_probs.items()
+                )
+                multipliers[strategy] = blended
+        else:
+            multipliers = _REGIME_MULTIPLIERS.get(regime, {})
 
         adjusted: List[StrategyAllocation] = []
         for a in base.allocations:
@@ -198,7 +218,7 @@ class CapitalAllocator:
         return AllocationResult(
             total_capital=self.cfg.total_capital,
             allocations=adjusted,
-            mode=f"regime:{regime.value}",
+            mode=f"regime_soft:{regime.value}" if soft_blend_active else f"regime:{regime.value}",
         )
 
     def _mean_sharpe(self, strategy: str) -> Optional[float]:

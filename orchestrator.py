@@ -25,7 +25,7 @@ from .adapters.mr_adapter import MRAdapter
 from .adapters.tf_adapter import TFAdapter
 from .adapters.vb_adapter import VBAdapter
 from .config import HarnessConfig, get_config
-from .regime import Regime, detect_regime
+from .regime import Regime, detect_regime, get_regime_probs
 from .allocator import CapitalAllocator
 from .paper_trading.db import save_regime_log
 
@@ -175,11 +175,20 @@ class Orchestrator:
             except Exception:
                 pass
                 
-            spy_ohlcv = fetch_ohlcv("SPY", lookback_days=252)
-            regime = detect_regime(spy_ohlcv, previous_regime=previous_regime)
-            allocation = CapitalAllocator(self.cfg).allocate_for_regime(regime)
-            log.info("[orchestrator] Regime=%s | Mode=%s", regime.value, allocation.mode)
-            print(f"  Regime: {regime.value.upper()}  |  Allocation: " +
+            spy_ohlcv = fetch_ohlcv("SPY", lookback_days=365)
+            regime = detect_regime(
+                spy_ohlcv,
+                previous_regime=previous_regime,
+                mode=self.cfg.regime_mode,
+                model_path=self.cfg.regime_model_path,
+            )
+            regime_probs = None
+            if self.cfg.regime_soft_blend:
+                regime_probs = get_regime_probs(spy_ohlcv, model_path=self.cfg.regime_model_path)
+            allocation = CapitalAllocator(self.cfg).allocate_for_regime(regime, regime_probs=regime_probs)
+            log.info("[orchestrator] Regime=%s | DetectionMode=%s | AllocationMode=%s",
+                     regime.value, self.cfg.regime_mode, allocation.mode)
+            print(f"  Regime: {regime.value.upper()} [{self.cfg.regime_mode}]  |  Allocation: " +
                   "  ".join(f"{a.strategy}={a.capital:,.0f}" for a in allocation.allocations))
             
             # Circuit breaker check 1: Regime

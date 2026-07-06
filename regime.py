@@ -57,7 +57,12 @@ def _realised_vol_ann(close: pd.Series, window: int = 20) -> Optional[float]:
     return float(rets.tail(window).std() * np.sqrt(252))
 
 
-def detect_regime(ohlcv: pd.DataFrame, previous_regime: Optional[Regime] = None) -> Regime:
+def detect_regime(
+    ohlcv: pd.DataFrame,
+    previous_regime: Optional[Regime] = None,
+    mode: str = "heuristic",
+    model_path: Optional[str] = None,
+) -> Regime:
     """Classify the current market regime from a daily OHLCV DataFrame.
 
     Args:
@@ -66,10 +71,21 @@ def detect_regime(ohlcv: pd.DataFrame, previous_regime: Optional[Regime] = None)
                Index must be datetime-like and sorted ascending.
                Minimum 200 rows recommended for reliable 200-SMA.
         previous_regime: The regime identified in the previous run (for hysteresis).
+        mode: "heuristic" (default, unchanged behaviour) or "model" (Phase 4 A4
+              learned classifier). "model" gracefully falls back to "heuristic"
+              if the model file is missing, fails to load, or prediction fails
+              for any reason — this function never raises due to `mode="model"`.
+        model_path: path to the trained model file. Only used when mode="model".
 
     Returns:
         Regime enum value.
     """
+    if mode == "model":
+        predicted = _detect_regime_model(ohlcv, model_path)
+        if predicted is not None:
+            return predicted
+        # Graceful fallback — model unavailable/failed, use heuristic below.
+
     # Normalise column names to lowercase so this works with any source
     df = ohlcv.copy()
     df.columns = [c.lower() for c in df.columns]
@@ -108,3 +124,59 @@ def detect_regime(ohlcv: pd.DataFrame, previous_regime: Optional[Regime] = None)
     if trending and above_200 is False and momentum < 0:
         return Regime.BEAR_TREND
     return Regime.RANGE_BOUND
+
+
+def get_regime_probs(
+    ohlcv: pd.DataFrame,
+    model_path: Optional[str] = None,
+) -> Optional[dict]:
+    """Return the probability dict {Regime: float} from the learned model.
+
+    Used by orchestrator when cfg.regime_soft_blend=True so the allocator can
+    blend _REGIME_MULTIPLIERS by probability rather than hard-pick. Returns None
+    on any failure (model missing, feature build failed, etc.) — never raises.
+    """
+    try:
+        from .regime_features import build_live_feature_vector
+        from .regime_model import RegimeClassifier
+
+        features = build_live_feature_vector(ohlcv)
+        if features is None:
+            return None
+
+        clf = RegimeClassifier(model_path=model_path)
+        if not clf.load():
+            return None
+
+        return clf.predict_proba(features)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("[regime] get_regime_probs failed: %s", e)
+        return None
+
+
+def _detect_regime_model(ohlcv: pd.DataFrame, model_path: Optional[str]) -> Optional[Regime]:
+    """Attempt learned-model regime prediction. Returns None on ANY failure
+    (missing model file, missing/failed live feature fetch, prediction error)
+    so the caller falls back to the heuristic. Never raises.
+
+    Lazy imports to avoid a circular import with regime_model.py (which
+    imports Regime from this module).
+    """
+    try:
+        from .regime_features import build_live_feature_vector
+        from .regime_model import RegimeClassifier
+
+        features = build_live_feature_vector(ohlcv)
+        if features is None:
+            return None
+
+        clf = RegimeClassifier(model_path=model_path)
+        if not clf.load():
+            return None
+
+        return clf.predict(features)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning("[regime] Learned-model prediction failed: %s", e)
+        return None
