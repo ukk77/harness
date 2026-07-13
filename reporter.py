@@ -225,6 +225,144 @@ class Reporter:
         self.print_recent_trades()
         self.print_strategy_comparison()
 
+    # ── Regime log helper ─────────────────────────────────────────────────────
+
+    def _read_latest_regime_log(self) -> dict:
+        """Return the most recent regime_log row as a plain dict.
+
+        Keys: ``regime``, ``allocation_mode``, ``allocations`` (list of dicts),
+        ``allocation_summary`` (compact string).  All values default to empty
+        strings / empty lists if the table cannot be read.
+        """
+        result = {
+            "regime": "",
+            "allocation_mode": "",
+            "allocations": [],
+            "allocation_summary": "",
+        }
+        try:
+            import sqlite3 as _sqlite3
+            with _sqlite3.connect(str(self.db.db_path)) as conn:
+                row = conn.execute(
+                    "SELECT regime, allocation_mode, allocations_json "
+                    "FROM regime_log ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            if row:
+                allocations = json.loads(row[2] or "[]")
+                result["regime"] = row[0]
+                result["allocation_mode"] = row[1]
+                result["allocations"] = allocations
+                result["allocation_summary"] = "  ".join(
+                    f"{a['strategy'].upper()}=${a['capital']:,.0f}"
+                    for a in allocations
+                )
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[reporter] Could not read regime_log: %s", exc
+            )
+        return result
+
+    # ── LLM run summary ───────────────────────────────────────────────────────
+
+    def summarize_run(self, report: dict) -> Optional[str]:
+        """Generate a 2-3 paragraph plain-English narrative for this run.
+
+        Reads regime + allocation from the report dict (populated by
+        ``save_run_report`` before this is called).  Fetches open-position
+        counts directly from the DB.  Returns ``None`` on any failure — the
+        run is never blocked.
+
+        Only called when ``cfg.summary_mode == 'llm'``.
+        """
+        if self.cfg.summary_mode != "llm":
+            return None
+
+        open_count = 0
+        unreal_pnl = 0.0
+        try:
+            from .paper_trading.unified_reader import summary as _db_summary
+            s = _db_summary()
+            open_count = s.get("open_positions", 0)
+            unreal_pnl = s.get("total_unrealized_pnl", 0.0)
+        except Exception:
+            pass
+
+        signals = report.get("signals", {})
+        buys = sorted(
+            [(t, d["confidence"]) for t, d in signals.items() if d["action"] == "BUY"],
+            key=lambda x: -x[1],
+        )[:5]
+        sells = sorted(
+            [(t, d["confidence"]) for t, d in signals.items() if d["action"] == "SELL"],
+            key=lambda x: -x[1],
+        )[:5]
+        buy_str  = ", ".join(f"{t}({c:.2f})" for t, c in buys)  or "none"
+        sell_str = ", ".join(f"{t}({c:.2f})" for t, c in sells) or "none"
+
+        regime_label    = report.get("regime", "unknown").upper()
+        alloc_summary   = report.get("allocation_summary", "unavailable")
+        actionable      = report.get("actionable", 0)
+        total_tickers   = report.get("total_tickers", 0)
+        conflicts       = report.get("conflicts", 0)
+        holds           = total_tickers - actionable - conflicts
+        pnl_str         = f"${unreal_pnl:+,.0f}"
+
+        prompt = (
+            "You are an operator reviewing a live/paper algorithmic trading system run. "
+            "Write a concise 2-3 paragraph plain-English narrative covering: "
+            "(1) what the current market regime means and how capital has been allocated, "
+            "(2) which signals were generated and the key trades taken, "
+            "(3) the current portfolio state and any notable observations or risks.\n\n"
+            "Run data:\n"
+            f"- Time         : {report.get('run_at', 'unknown')}  "
+            f"({'dry-run' if report.get('dry_run') else 'live/paper'})\n"
+            f"- Regime       : {regime_label}\n"
+            f"- Allocation   : {alloc_summary}\n"
+            f"- Signals      : {actionable} executed | {holds} HOLD | {conflicts} conflicts blocked\n"
+            f"- Top BUYs     : {buy_str}\n"
+            f"- Top SELLs    : {sell_str}\n"
+            f"- Open positions: {open_count}  (unrealized P&L: {pnl_str})\n\n"
+            "Be factual and concise. Do not invent numbers not present above. "
+            "Do not repeat raw numbers verbatim — synthesise them into readable prose."
+        )
+
+        from .llm_client import call_llm
+        return call_llm(
+            prompt,
+            provider=self.cfg.llm_provider,
+            model=self.cfg.llm_model,
+            base_url=self.cfg.llm_base_url,
+        )
+
+    # ── RAG-grounded run summary (A9) ─────────────────────────────────────────
+
+    def enrich_with_context(self, report: dict) -> Optional[str]:
+        """Generate a RAG-grounded operator narrative via rag_service.
+
+        Called when ``cfg.summary_mode == 'rag'``.  Supersedes A2 LLM narrative
+        when rag_service is deployed.  Returns ``None`` silently on any failure.
+        """
+        if self.cfg.summary_mode != "rag":
+            return None
+        try:
+            from .rag_client import RAGClient
+            client = RAGClient(base_url=self.cfg.rag_service_url)
+            if not client.is_up():
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "[reporter] rag_service unreachable at %s — skipping RAG narrative",
+                    self.cfg.rag_service_url,
+                )
+                return None
+            return client.summarize(report)
+        except Exception as exc:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "[reporter] enrich_with_context failed (non-blocking): %s", exc
+            )
+            return None
+
     # ── Save run report to file ───────────────────────────────────────────────
 
     def save_run_report(
@@ -264,8 +402,44 @@ class Reporter:
             "signals": signals_out,
         }
 
+        regime_info = self._read_latest_regime_log()
+        if regime_info["regime"]:
+            report["regime"] = regime_info["regime"]
+            report["allocation_mode"] = regime_info["allocation_mode"]
+            report["allocation_summary"] = regime_info["allocation_summary"]
+
+        narrative: Optional[str] = None
+        if self.cfg.summary_mode == "llm":
+            narrative = self.summarize_run(report)
+            if narrative:
+                report["llm_summary"] = narrative
+            else:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "[reporter] LLM summary skipped — no response from %s/%s",
+                    self.cfg.llm_provider, self.cfg.llm_model,
+                )
+        elif self.cfg.summary_mode == "rag":
+            narrative = self.enrich_with_context(report)
+            if narrative:
+                report["rag_summary"] = narrative
+            else:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "[reporter] RAG summary skipped — rag_service unavailable or failed"
+                )
+
+        summary_key = "rag_summary" if self.cfg.summary_mode == "rag" else "llm_summary"
+        summary_label = "RAG RUN SUMMARY" if self.cfg.summary_mode == "rag" else "LLM RUN SUMMARY"
+
         try:
             report_path.write_text(json.dumps(report, indent=2))
             print(f"\n  Run report saved: {report_path}")
+            if report.get(summary_key):
+                print(f"\n{'─'*72}")
+                print(f"  {summary_label}")
+                print(f"{'─'*72}")
+                print(report[summary_key])
+                print(f"{'─'*72}")
         except Exception as e:
             print(f"\n  WARNING: Could not save run report: {e}")

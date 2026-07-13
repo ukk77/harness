@@ -110,6 +110,21 @@ class HarnessConfig:
     regime_model_path: str = field(default_factory=lambda: os.environ.get(
         "REGIME_MODEL_PATH", str(_TRADING_ROOT / "models" / "regime_xgb.json")))
 
+    # ── LLM Run Summary (Phase 4, A2) ────────────────────────────────────────
+    summary_mode: str = "rag"            # "none" (default) | "llm" | "rag"
+    llm_provider: str = field(default_factory=lambda: os.environ.get(
+        "RAG_LLM_PROVIDER", "ollama"))
+    llm_model: str = field(default_factory=lambda: os.environ.get(
+        "LLM_MODEL", "llama3.2:3b"))
+    llm_base_url: str = field(default_factory=lambda: os.environ.get(
+        "LLM_BASE_URL", "http://localhost:11434"))
+
+    # ── RAG Service (Phase 4, A9) ────────────────────────────────────────────
+    rag_service_url: str = field(default_factory=lambda: os.environ.get(
+        "RAG_SERVICE_URL", "http://localhost:8200"))
+    rag_enrichment_enabled: bool = False   # signal-enrichment hook (gate; default off)
+    rag_ingest_on_collect: bool = True     # trigger POST /api/ingest after data_collection
+
     # ── Schedule ─────────────────────────────────────────────────────────────
     # data_collection runs: 08:00, 11:00, 14:00, 17:00 ET
     data_collection_times: List[str] = field(

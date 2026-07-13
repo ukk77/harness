@@ -26,6 +26,7 @@ from .adapters.tf_adapter import TFAdapter
 from .adapters.vb_adapter import VBAdapter
 from .config import HarnessConfig, get_config
 from .regime import Regime, detect_regime, get_regime_probs
+from .regime_features import compute_regime_features
 from .allocator import CapitalAllocator
 from .paper_trading.db import save_regime_log
 
@@ -51,6 +52,8 @@ class Orchestrator:
     def __init__(self, cfg: Optional[HarnessConfig] = None):
         self.cfg = cfg or get_config()
         self._adapters: Dict[str, BaseAdapter] = {}
+        self._last_regime: Optional[str] = None
+        self._last_regime_features: Dict[str, Optional[float]] = {}
         self._init_adapters()
 
     def _init_adapters(self) -> None:
@@ -214,7 +217,21 @@ class Orchestrator:
                     "weight": round(a.weight, 4),
                     "sharpe": a.sharpe,
                 } for a in allocation.allocations],
+                db_path=Path(self.cfg.paper_db_path),
             )
+            # A3-Data: store regime + features on instance for signal_log (cli.py reads these)
+            self._last_regime = regime.value
+            try:
+                import pandas as _pd
+                feats_df = compute_regime_features(spy_ohlcv)
+                if not feats_df.empty:
+                    row = feats_df.iloc[-1]
+                    self._last_regime_features = {
+                        k: (None if _pd.isna(v) else float(v))
+                        for k, v in row.items()
+                    }
+            except Exception as _feat_exc:
+                log.debug("regime_features extraction failed: %s", _feat_exc)
         except Exception as exc:
             log.warning("[orchestrator] Regime detection failed: %s", exc)
         # Build (ticker, strategy, adapter) task list

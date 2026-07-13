@@ -56,6 +56,7 @@ class HealthChecker:
     def run(self) -> HealthReport:
         report = HealthReport()
         report.results.extend(self._check_apis())
+        report.results.extend(self._check_rag())
         report.results.extend(self._check_models())
         report.results.extend(self._check_market_data())
         report.results.extend(self._check_strategy_imports())
@@ -115,6 +116,28 @@ class HealthChecker:
             except Exception as e:
                 results.append(HealthResult(f"{name}_api", "FAIL", f"Unreachable: {type(e).__name__}"))
         return results
+
+    # ── RAG service check (non-critical — WARN if down, never FAIL) ───────────
+
+    def _check_rag(self) -> List[HealthResult]:
+        """Check rag_service reachability. Degraded (WARN) if down — not in critical path."""
+        t0 = time.time()
+        try:
+            url = getattr(self.cfg, "rag_service_url", "http://localhost:8200")
+            resp = requests.get(f"{url}/api/health", timeout=5)
+            latency = (time.time() - t0) * 1000
+            if resp.status_code == 200:
+                data = resp.json()
+                status = data.get("status", "unknown")
+                doc_count = data.get("doc_count", 0)
+                if status == "healthy":
+                    return [HealthResult("rag_service", "OK", f"UP ({latency:.0f}ms, {doc_count} docs)")]
+                else:
+                    return [HealthResult("rag_service", "WARN", f"{status} — {data.get('detail', '')} ({latency:.0f}ms)")]
+            else:
+                return [HealthResult("rag_service", "WARN", f"HTTP {resp.status_code} (degraded — not critical)")]
+        except Exception as e:
+            return [HealthResult("rag_service", "WARN", f"Unreachable (degraded — not critical): {type(e).__name__}")]
 
     # ── Model file checks ─────────────────────────────────────────────────────
 

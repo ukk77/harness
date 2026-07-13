@@ -65,6 +65,29 @@ def init_db(db_path: Optional[Path] = None) -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_regime_log_date ON regime_log(logged_at);
+
+            CREATE TABLE IF NOT EXISTS signal_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at       TEXT    NOT NULL,
+                ticker          TEXT    NOT NULL,
+                action          TEXT    NOT NULL,
+                confidence      REAL,
+                conflict        INTEGER NOT NULL DEFAULT 0,
+                regime          TEXT,
+                n_votes_buy     INTEGER DEFAULT 0,
+                n_votes_sell    INTEGER DEFAULT 0,
+                n_votes_hold    INTEGER DEFAULT 0,
+                strategy_votes  TEXT,
+                entry_price     REAL,
+                vol_20d         REAL,
+                adx             REAL,
+                sma200_dist     REAL,
+                rsi             REAL,
+                momentum_20d    REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_signal_log_ticker ON signal_log(ticker);
+            CREATE INDEX IF NOT EXISTS idx_signal_log_date   ON signal_log(logged_at);
         """)
         conn.commit()
         # Migration: add realized_pnl column if it doesn't exist (for existing DBs)
@@ -73,6 +96,65 @@ def init_db(db_path: Optional[Path] = None) -> None:
             conn.commit()
         except Exception:
             pass
+
+
+def save_signal_log(
+    signals: Dict[str, Any],
+    regime: Optional[str] = None,
+    regime_features: Optional[Dict[str, Any]] = None,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Persist reconciled signal feature vectors to signal_log for A3 meta-labeler training.
+
+    Args:
+        signals: dict of {ticker: ReconciledSignal} from reconciler.
+        regime: current regime string (e.g. 'bear_trend').
+        regime_features: dict with keys vol_20d, adx, sma200_dist, rsi, momentum_20d
+                         computed from SPY OHLCV (same for all tickers per run).
+        db_path: override DB path; defaults to cfg-controlled path passed by caller.
+    """
+    db_path = db_path or _DEFAULT_DB
+    init_db(db_path)
+    logged_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    feats = regime_features or {}
+
+    rows = []
+    for ticker, sig in signals.items():
+        votes: Dict[str, str] = getattr(sig, "votes", {}) or {}
+        n_buy = sum(1 for v in votes.values() if str(v).upper() == "BUY")
+        n_sell = sum(1 for v in votes.values() if str(v).upper() == "SELL")
+        n_hold = sum(1 for v in votes.values() if str(v).upper() == "HOLD")
+        rows.append((
+            logged_at,
+            ticker,
+            str(getattr(sig, "action", "HOLD")),
+            getattr(sig, "confidence", None),
+            1 if getattr(sig, "conflict", False) else 0,
+            regime,
+            n_buy,
+            n_sell,
+            n_hold,
+            json.dumps(votes) if votes else None,
+            getattr(sig, "price", None),
+            feats.get("vol_20d"),
+            feats.get("adx"),
+            feats.get("sma200_dist"),
+            feats.get("rsi"),
+            feats.get("momentum_20d"),
+        ))
+
+    if not rows:
+        return
+    with _conn(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO signal_log "
+            "(logged_at, ticker, action, confidence, conflict, regime, "
+            "n_votes_buy, n_votes_sell, n_votes_hold, strategy_votes, entry_price, "
+            "vol_20d, adx, sma200_dist, rsi, momentum_20d) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
 
 
 def save_regime_log(

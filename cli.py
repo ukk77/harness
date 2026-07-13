@@ -366,12 +366,82 @@ def cmd_data_collection(args) -> None:
     print(f"\r  Risk:      {risk_ok} OK  {risk_fail} failed ({len(tickers)} tickers)          ")
     log.info("Risk collection: %d ok, %d failed", risk_ok, risk_fail)
 
+    # ── Step 3: RAG ingest (incremental, non-blocking) ────────────────────────
+    if getattr(cfg, "rag_ingest_on_collect", True):
+        print("  Triggering RAG ingestion (incremental)...", end="", flush=True)
+        try:
+            from harness.rag_client import RAGClient
+            rag = RAGClient(base_url=cfg.rag_service_url)
+            result = rag.ingest()
+            if result:
+                total_added = result.get("total_docs_added", 0)
+                print(f"\r  RAG ingest: +{total_added} docs                  ")
+                log.info("RAG ingest complete: +%d docs", total_added)
+            else:
+                print(f"\r  RAG ingest: skipped (rag_service unavailable)    ")
+                log.debug("RAG ingest skipped — rag_service not reachable")
+        except Exception as _rag_exc:
+            print(f"\r  RAG ingest: failed (non-blocking)                ")
+            log.warning("RAG ingest failed (non-blocking): %s", _rag_exc)
+
     # ── Summary ───────────────────────────────────────────────────────────────
     print()
     print(f"  DATA COLLECTION COMPLETE")
     print(f"  Sentiment: {sent_ok}/{len(tickers)} OK")
     print(f"  Risk:      {risk_ok}/{len(tickers)} OK")
     log.info("data_collection complete")
+
+
+# ── cmd_ask ───────────────────────────────────────────────────────────────────
+
+def cmd_ask(args) -> None:
+    """Query the RAG market-intelligence layer with a free-text question."""
+    _setup_logging("ask")
+    from harness.config import get_config
+    cfg = get_config()
+    query = " ".join(args.query)
+    ticker = getattr(args, "ticker", None)
+    days = getattr(args, "days", 30)
+
+    # Auto-detect ticker from query if not explicitly provided
+    if not ticker:
+        import re
+        words = re.findall(r'[A-Za-z]+', query.upper())
+        for word in words:
+            if word in cfg.tickers:
+                ticker = word
+                break
+
+    from harness.rag_client import RAGClient
+    client = RAGClient(base_url=cfg.rag_service_url)
+
+    if not client.is_up():
+        print(f"  ERROR: rag_service is not reachable at {cfg.rag_service_url}")
+        print("  Start it with: python -m app.main  (from rag_service/)")
+        return
+
+    from datetime import datetime, timedelta, timezone
+    date_from = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d") if days else None
+
+    result = client.ask(query=query, ticker=ticker, date_from=date_from)
+    if not result:
+        print("  rag_service returned no answer.")
+        return
+
+    print(f"\n{'═'*72}")
+    print(f"  QUESTION: {query}")
+    if ticker:
+        print(f"  Ticker filter: {ticker}")
+    print(f"{'═'*72}")
+    print(result.get("answer", "(no answer)"))
+    print(f"\n{'─'*72}")
+    sources = result.get("sources", [])
+    if sources:
+        print(f"  Sources ({len(sources)}):")
+        for s in sources[:5]:
+            print(f"    [{s.get('source','?')}] {s.get('ticker','?')} {s.get('date','?')} — {s.get('text','')[:80]}...")
+    print(f"{'─'*72}")
+    print(f"  Model: {result.get('model_used', '?')}")
 
 
 # ── cmd_comprehensive ─────────────────────────────────────────────────────────
@@ -604,6 +674,20 @@ def cmd_signal_generation(args) -> None:
     print(f"  Actionable: {actionable}  |  Conflicts blocked: {conflicts}  |  HOLD: {len(reconciled)-actionable}")
     log.info("Step 2 done in %.1fs — %d actionable, %d conflicts",
              time.time() - t0, actionable, conflicts)
+
+    # A3-Data: persist signal feature vectors for future meta-labeler training
+    try:
+        from harness.paper_trading.db import save_signal_log
+        from pathlib import Path as _Path
+        save_signal_log(
+            signals=reconciled,
+            regime=getattr(orchestrator, "_last_regime", None),
+            regime_features=getattr(orchestrator, "_last_regime_features", None),
+            db_path=_Path(cfg.paper_db_path),
+        )
+        log.debug("signal_log: %d rows written", len(reconciled))
+    except Exception as _sl_exc:
+        log.warning("signal_log write failed (non-blocking): %s", _sl_exc)
 
     # ── Step 3: Allocate capital ──────────────────────────────────────────────
     _step(3, STEPS, "Computing capital allocation (Sharpe-weighted)")
@@ -915,6 +999,43 @@ def cmd_schedule(args) -> None:
         except Exception as ex:
             print(f"  [!]  Could not delete {path.name}: {ex}")
 
+    # ── RagMarketIntelligenceService (AtLogon — keeps port 8200 up) ─────────────
+    rag_xml = textwrap.dedent(f"""<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>RAG Market Intelligence FastAPI service — keeps localhost:8200 running for harness RAG enrichment and cmd_ask</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>
+  </Triggers>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{sys.executable}</Command>
+      <Arguments>-m app.main</Arguments>
+      <WorkingDirectory>{_TRADING_ROOT / 'rag_service'}</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>""").strip()
+
+    rag_xml_path = _TRADING_ROOT / "RagMarketIntelligenceService.xml"
+    rag_xml_path.write_text(rag_xml, encoding="utf-16")
+    try:
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", "RagMarketIntelligenceService", "/XML", str(rag_xml_path), "/F"],
+            check=True, capture_output=True, text=True,
+        )
+        print("  [OK] Task registered: RagMarketIntelligenceService")
+    except subprocess.CalledProcessError as e:
+        print(f"  [!]  schtasks failed for RagMarketIntelligenceService: {e.stderr.strip()}")
+        print(f"       Import manually: schtasks /Create /TN RagMarketIntelligenceService /XML {rag_xml_path} /F")
+
     print("\n  Harness tasks registered. Legacy tasks removed.")
     print("  View in Task Scheduler → Task Scheduler Library.\n")
 
@@ -1200,6 +1321,12 @@ def _parse_args():
                             help="Run auth-protected deep-dive analysis on tickers")
     p_comp.add_argument("tickers", nargs="+", help="One or more ticker symbols")
 
+    p_ask = sub.add_parser("ask",
+                           help="Query RAG market-intelligence layer with a free-text question")
+    p_ask.add_argument("query", nargs="+", help="Free-text query (e.g. \"what is the recent sentiment for NVDA?\")") 
+    p_ask.add_argument("--ticker", default=None, help="Filter results to a specific ticker")
+    p_ask.add_argument("--days", type=int, default=30, help="Lookback window in days (default: 30)")
+
     # Legacy alias: 'run' → signal_generation for backwards compatibility
     p_run = sub.add_parser("run", help="Alias for signal_generation")
     p_run.add_argument("--dry-run", action="store_true")
@@ -1218,6 +1345,7 @@ def main():
         "data": cmd_data,
         "data_collection": cmd_data_collection,
         "comprehensive": cmd_comprehensive,
+        "ask": cmd_ask,
         "signal_generation": cmd_signal_generation,
         "run": cmd_signal_generation,   # legacy alias
         "report": cmd_report,
