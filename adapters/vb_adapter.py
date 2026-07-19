@@ -53,7 +53,8 @@ class VBAdapter(BaseAdapter):
 
         price = float(sig.price) if sig.price else 0.0
 
-        confidence = float(sig.kelly_fraction) if sig.kelly_fraction else 0.0
+        # Use filtered_strength as primary confidence (aligns with MR/TF adapters)
+        confidence = float(sig.filtered_strength) if sig.filtered_strength else 0.0
         if action == "BUY" and confidence == 0.0:
             confidence = 0.5
         if action == "HOLD":

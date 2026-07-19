@@ -113,6 +113,10 @@ def compute_price_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# Alias used by orchestrator.py
+compute_regime_features = compute_price_features
+
+
 def fetch_vix_live(fallback_realised_vol: Optional[float] = None) -> Optional[float]:
     """Fetch the latest VIX close via yfinance. Never raises.
 

@@ -201,11 +201,19 @@ _SVC_DEFS = [
         "args": ["-m", "backend.app.main"],
         "cwd": str(_TRADING_ROOT / "risk_calculator"),
     },
+    {
+        "name": "rag_service",
+        "health_url_tmpl": "{rag_service_url}/api/health",
+        "ready_url_tmpl": "{rag_service_url}/",
+        "python": str(_TRADING_ROOT / "rag_service" / "venv" / "Scripts" / "python.exe"),
+        "args": ["-m", "app.main"],
+        "cwd": str(_TRADING_ROOT / "rag_service"),
+    },
 ]
 
 
 def _ensure_services_up(cfg, log: logging.Logger) -> None:
-    """Start sentiment and risk services if not running; wait up to 90s for readiness."""
+    """Start sentiment, risk, and RAG services if not running; wait up to 150s for readiness."""
     import subprocess
     import requests as _req
 
@@ -214,10 +222,12 @@ def _ensure_services_up(cfg, log: logging.Logger) -> None:
         health_url = svc["health_url_tmpl"].format(
             sentiment_api_url=cfg.sentiment_api_url,
             risk_api_url=cfg.risk_api_url,
+            rag_service_url=cfg.rag_service_url,
         )
         ready_url = svc["ready_url_tmpl"].format(
             sentiment_api_url=cfg.sentiment_api_url,
             risk_api_url=cfg.risk_api_url,
+            rag_service_url=cfg.rag_service_url,
         )
         try:
             _req.get(ready_url, timeout=20)  # any response = port is bound = service is up
@@ -245,7 +255,7 @@ def _ensure_services_up(cfg, log: logging.Logger) -> None:
             stderr=_svc_out,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
-        started.append((svc["name"], ready_url, proc))
+        started.append((svc["name"], health_url, proc))
 
     if not started:
         return
@@ -259,9 +269,10 @@ def _ensure_services_up(cfg, log: logging.Logger) -> None:
         still_waiting = []
         for name, url, proc in pending:
             try:
-                _req.get(url, timeout=20)  # any response = ready
-                log.info("%s ready", name)
-                continue
+                r = _req.get(url, timeout=20)
+                if r.status_code == 200:
+                    log.info("%s ready", name)
+                    continue
             except Exception:
                 pass
             still_waiting.append((name, url, proc))
@@ -396,9 +407,10 @@ def cmd_data_collection(args) -> None:
 
 def cmd_ask(args) -> None:
     """Query the RAG market-intelligence layer with a free-text question."""
-    _setup_logging("ask")
+    log = _setup_logging("ask")
     from harness.config import get_config
     cfg = get_config()
+    _ensure_services_up(cfg, log)
     query = " ".join(args.query)
     ticker = getattr(args, "ticker", None)
     days = getattr(args, "days", 30)
