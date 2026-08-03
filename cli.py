@@ -687,6 +687,15 @@ def cmd_signal_generation(args) -> None:
     log.info("Step 2 done in %.1fs — %d actionable, %d conflicts",
              time.time() - t0, actionable, conflicts)
 
+    # ── Step 2.5: Exit-sweep — enforce stop/hold-horizon regardless of confidence ──
+    from harness.exit_sweep import sweep_exits
+    sweep_counts = sweep_exits(reconciled, raw_signals, cfg)
+    if sweep_counts["stops_triggered"] or sweep_counts["holds_expired"]:
+        print(f"  Exit-sweep: {sweep_counts['stops_triggered']} stop(s) triggered, "
+              f"{sweep_counts['holds_expired']} hold(s) expired — forced SELL")
+        log.info("Exit-sweep forced %d stop(s), %d hold-expiry(s)",
+                  sweep_counts["stops_triggered"], sweep_counts["holds_expired"])
+
     # A3-Data: persist signal feature vectors for future meta-labeler training
     try:
         from harness.paper_trading.db import save_signal_log
@@ -817,6 +826,38 @@ def cmd_signal_generation(args) -> None:
     reporter.print_positions()
     reporter.save_run_report(reconciled, raw_signals, executed, skipped, dry_run)
     log.info("Step 5 done — report saved")
+
+    # I3: Persist per-run observability counters so drift (exposure creeping up,
+    # stops never firing, circuit breaker silently inactive) is visible in the
+    # DB rather than only in scrollback logs.
+    if not dry_run:
+        try:
+            from harness.paper_trading.db import HarnessTradingDB, save_run_summary
+            _sdb = HarnessTradingDB(cfg.paper_db_path)
+            positions_opened = sum(1 for _, rec in to_execute if rec.action == "BUY")
+            positions_closed = sum(1 for _, rec in to_execute if rec.action == "SELL")
+            circuit_breaker_blocked = sum(
+                1 for sigs in raw_signals.values() for s in sigs
+                if s.reason and "blocked:circuit_breaker" in s.reason
+            )
+            all_pos = _sdb.get_all_positions()
+            position_values = [p["shares"] * p["current_price"] for p in all_pos]
+            aggregate_exposure_pct = (sum(position_values) / harness_capital) if harness_capital else None
+            max_single_position_pct = (max(position_values) / harness_capital) if position_values and harness_capital else None
+            save_run_summary(
+                positions_opened=positions_opened,
+                positions_closed=positions_closed,
+                stops_triggered=sweep_counts["stops_triggered"],
+                holds_expired=sweep_counts["holds_expired"],
+                circuit_breaker_blocked=circuit_breaker_blocked,
+                aggregate_exposure_pct=aggregate_exposure_pct,
+                max_single_position_pct=max_single_position_pct,
+                total_unrealized_pnl=_sdb.total_unrealized_pnl(),
+                today_realized_pnl=_sdb.today_realized_pnl(),
+                db_path=Path(cfg.paper_db_path),
+            )
+        except Exception as e:
+            log.warning("Failed to save run_summary (I3): %s", e)
 
     _section("SIGNAL GENERATION COMPLETE")
     print(f"  Trades executed : {executed}")

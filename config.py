@@ -103,6 +103,23 @@ class HarnessConfig:
     trade_cooldown_hours: int = 4
     circuit_breaker_drawdown_pct: float = 0.05  # Halt trading if portfolio DD > 5% today
     circuit_breaker_extreme_bearish: bool = True # Halt trading if regime is bear + high vol
+    # Annualized realized-vol threshold (20d) that, combined with a bearish
+    # SPY trend (below 200-SMA + negative 20d momentum), trips the circuit
+    # breaker above. Below the heuristic's own HIGH_VOL classification cutoff
+    # (~0.28-0.30) so genuinely elevated-but-not-extreme bear conditions are
+    # still caught, without firing on every ordinary bear trend.
+    circuit_breaker_bear_vol_threshold: float = 0.22
+
+    # PaperExecutor mirrors every fill to the real Alpaca paper account by
+    # default. Set False for hermetic/offline runs (e.g. tests) that should
+    # not make network calls to an external service (§ 10 I2).
+    alpaca_mirror_enabled: bool = True
+
+    # ── DCA-into-losers guard (§ 10 S2) ──────────────────────────────────────
+    # Block adding to an existing position when it is underwater beyond this
+    # threshold, UNLESS the new signal's confidence exceeds the position's
+    # running average entry confidence (i.e. genuinely higher conviction).
+    dca_loss_guard_pct: float = 0.05
 
     # ── Regime detection (Phase 4, A4) ──────────────────────────────────────
     regime_mode: str = "model"            # "model" (learned XGBoost classifier) | "heuristic" (fallback)

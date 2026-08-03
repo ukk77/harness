@@ -27,15 +27,19 @@ def init_db(db_path: Optional[Path] = None) -> None:
     with _conn(db_path) as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS positions (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                ticker          TEXT    NOT NULL,
-                strategy        TEXT    NOT NULL,
-                shares          REAL    NOT NULL DEFAULT 0,
-                entry_price     REAL    NOT NULL DEFAULT 0,
-                current_price   REAL    NOT NULL DEFAULT 0,
-                entry_time      TEXT    NOT NULL,
-                unrealized_pnl  REAL    NOT NULL DEFAULT 0,
-                realized_pnl    REAL    NOT NULL DEFAULT 0,
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticker              TEXT    NOT NULL,
+                strategy            TEXT    NOT NULL,
+                shares              REAL    NOT NULL DEFAULT 0,
+                entry_price         REAL    NOT NULL DEFAULT 0,
+                current_price       REAL    NOT NULL DEFAULT 0,
+                entry_time          TEXT    NOT NULL,
+                unrealized_pnl      REAL    NOT NULL DEFAULT 0,
+                realized_pnl        REAL    NOT NULL DEFAULT 0,
+                stop_price          REAL,
+                expected_hold_days  INTEGER,
+                risk_bucket         TEXT,
+                entry_confidence    REAL,
                 UNIQUE(ticker, strategy)
             );
 
@@ -88,6 +92,22 @@ def init_db(db_path: Optional[Path] = None) -> None:
 
             CREATE INDEX IF NOT EXISTS idx_signal_log_ticker ON signal_log(ticker);
             CREATE INDEX IF NOT EXISTS idx_signal_log_date   ON signal_log(logged_at);
+
+            CREATE TABLE IF NOT EXISTS run_summary (
+                id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                logged_at               TEXT    NOT NULL,
+                positions_opened        INTEGER NOT NULL DEFAULT 0,
+                positions_closed        INTEGER NOT NULL DEFAULT 0,
+                stops_triggered         INTEGER NOT NULL DEFAULT 0,
+                holds_expired           INTEGER NOT NULL DEFAULT 0,
+                circuit_breaker_blocked INTEGER NOT NULL DEFAULT 0,
+                aggregate_exposure_pct  REAL,
+                max_single_position_pct REAL,
+                total_unrealized_pnl    REAL,
+                today_realized_pnl      REAL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_run_summary_date ON run_summary(logged_at);
         """)
         conn.commit()
         # Migration: add realized_pnl column if it doesn't exist (for existing DBs)
@@ -96,6 +116,18 @@ def init_db(db_path: Optional[Path] = None) -> None:
             conn.commit()
         except Exception:
             pass
+        # Migration: add S1 exit-context columns to positions if missing (for existing DBs)
+        for col_def in (
+            "stop_price REAL",
+            "expected_hold_days INTEGER",
+            "risk_bucket TEXT",
+            "entry_confidence REAL",
+        ):
+            try:
+                conn.execute(f"ALTER TABLE positions ADD COLUMN {col_def}")
+                conn.commit()
+            except Exception:
+                pass
 
 
 def save_signal_log(
@@ -157,6 +189,43 @@ def save_signal_log(
         conn.commit()
 
 
+def save_run_summary(
+    positions_opened: int = 0,
+    positions_closed: int = 0,
+    stops_triggered: int = 0,
+    holds_expired: int = 0,
+    circuit_breaker_blocked: int = 0,
+    aggregate_exposure_pct: Optional[float] = None,
+    max_single_position_pct: Optional[float] = None,
+    total_unrealized_pnl: Optional[float] = None,
+    today_realized_pnl: Optional[float] = None,
+    db_path: Optional[Path] = None,
+) -> None:
+    """Persist per-run accumulation/observability counters (§ 10 I3).
+
+    Called once at the end of each signal_generation cycle so drift (exposure
+    creeping up, stops never triggering, etc.) is visible in the DB rather than
+    only in scrollback logs.
+    """
+    db_path = db_path or _DEFAULT_DB
+    init_db(db_path)
+    logged_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _conn(db_path) as conn:
+        conn.execute(
+            "INSERT INTO run_summary "
+            "(logged_at, positions_opened, positions_closed, stops_triggered, holds_expired, "
+            "circuit_breaker_blocked, aggregate_exposure_pct, max_single_position_pct, "
+            "total_unrealized_pnl, today_realized_pnl) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                logged_at, positions_opened, positions_closed, stops_triggered, holds_expired,
+                circuit_breaker_blocked, aggregate_exposure_pct, max_single_position_pct,
+                total_unrealized_pnl, today_realized_pnl,
+            ),
+        )
+        conn.commit()
+
+
 def save_regime_log(
     regime: str,
     allocation_mode: str,
@@ -194,20 +263,44 @@ class HarnessTradingDB:
         current_price: float,
         unrealized_pnl: float,
         realized_pnl: float = 0.0,
+        stop_price: Optional[float] = None,
+        expected_hold_days: Optional[int] = None,
+        risk_bucket: Optional[str] = None,
+        entry_confidence: Optional[float] = None,
     ) -> None:
+        """Insert or update a position.
+
+        S1 note: stop_price / expected_hold_days / risk_bucket / entry_confidence are
+        entry-time exit-context fields. When not explicitly passed (e.g. on a partial
+        SELL update), COALESCE preserves whatever was previously stored rather than
+        wiping it out. Also fixes a prior bug where entry_price was never updated on
+        conflict — DCA average-cost recalculation was silently discarded.
+        """
         with _conn(self.db_path) as conn:
             conn.execute("""
                 INSERT INTO positions
-                    (ticker, strategy, shares, entry_price, current_price, entry_time, unrealized_pnl, realized_pnl)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (ticker, strategy, shares, entry_price, current_price, entry_time, unrealized_pnl, realized_pnl,
+                     stop_price, expected_hold_days, risk_bucket, entry_confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(ticker, strategy) DO UPDATE SET
-                    shares        = excluded.shares,
-                    current_price = excluded.current_price,
-                    unrealized_pnl = excluded.unrealized_pnl,
-                    realized_pnl  = excluded.realized_pnl
+                    shares             = excluded.shares,
+                    entry_price        = excluded.entry_price,
+                    current_price      = excluded.current_price,
+                    unrealized_pnl     = excluded.unrealized_pnl,
+                    realized_pnl       = excluded.realized_pnl,
+                    stop_price         = COALESCE(excluded.stop_price, positions.stop_price),
+                    expected_hold_days = COALESCE(excluded.expected_hold_days, positions.expected_hold_days),
+                    risk_bucket        = COALESCE(excluded.risk_bucket, positions.risk_bucket),
+                    entry_confidence   = COALESCE(excluded.entry_confidence, positions.entry_confidence)
             """, (ticker, strategy, shares, entry_price, current_price,
-                  datetime.utcnow().isoformat(), unrealized_pnl, realized_pnl))
+                  datetime.utcnow().isoformat(), unrealized_pnl, realized_pnl,
+                  stop_price, expected_hold_days, risk_bucket, entry_confidence))
             conn.commit()
+
+    # Backward-compat alias used by AlpacaExecutor (previously called a
+    # non-existent `update_position` method — see § 10 S1 fix).
+    def update_position(self, *args, **kwargs) -> None:
+        self.upsert_position(*args, **kwargs)
 
     def get_position(self, ticker: str, strategy: str) -> Optional[Dict[str, Any]]:
         with _conn(self.db_path) as conn:
@@ -224,10 +317,11 @@ class HarnessTradingDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def close_position(self, ticker: str, strategy: str, realized_pnl: float) -> None:
+    def close_position(self, ticker: str, strategy: str, realized_pnl: float = 0.0) -> None:
         with _conn(self.db_path) as conn:
             conn.execute("""
-                UPDATE positions SET shares=0, unrealized_pnl=0, realized_pnl=realized_pnl+?
+                UPDATE positions SET shares=0, unrealized_pnl=0, realized_pnl=realized_pnl+?,
+                       stop_price=NULL, expected_hold_days=NULL, risk_bucket=NULL, entry_confidence=NULL
                 WHERE ticker=? AND strategy=?
             """, (realized_pnl, ticker, strategy))
 
@@ -321,6 +415,15 @@ class HarnessTradingDB:
     def total_realized_pnl(self) -> float:
         with _conn(self.db_path) as conn:
             row = conn.execute("SELECT SUM(realized_pnl) FROM positions").fetchone()
+        return float(row[0] or 0.0)
+
+    def today_realized_pnl(self) -> float:
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        with _conn(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT SUM(realized_pnl) FROM trades WHERE action='SELL' AND executed_at LIKE ?",
+                (f"{today}%",),
+            ).fetchone()
         return float(row[0] or 0.0)
 
     def total_unrealized_pnl(self) -> float:

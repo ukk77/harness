@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from .base import BaseAdapter, HarnessSignal
 
@@ -60,6 +61,12 @@ class VBAdapter(BaseAdapter):
         if action == "HOLD":
             confidence = 0.0
 
+        # S1: derive exit-context metadata from the strategy's own stop_loss
+        # (breakout candle low) rather than discarding it — see Master Spec § 10 S1.
+        suggested_stop_pct: Optional[float] = None
+        if sig.stop_loss and price > 0:
+            suggested_stop_pct = abs(price - float(sig.stop_loss)) / price
+
         return HarnessSignal(
             ticker=ticker,
             timestamp=datetime.now(),
@@ -69,4 +76,5 @@ class VBAdapter(BaseAdapter):
             price=price,
             suggested_shares=None,
             reason=sig.reason,
+            suggested_stop_pct=suggested_stop_pct,
         )

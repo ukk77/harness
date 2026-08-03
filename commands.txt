@@ -289,24 +289,24 @@ scheduler.py
            from 08:15 to 16:15 ET.
   Usage:   python scheduler.py
 
-run_paper_trading.py
+scripts\archive\run_paper_trading.py  [ARCHIVED — § 10 I4]
   Purpose: Legacy daily paper-trading runner for Trend Following.
            Prefer `python -m harness.cli run`.
-  Usage:   trend_following\venv\Scripts\python.exe run_paper_trading.py
-           trend_following\venv\Scripts\python.exe run_paper_trading.py --force
+  Usage:   trend_following\venv\Scripts\python.exe scripts\archive\run_paper_trading.py
+           trend_following\venv\Scripts\python.exe scripts\archive\run_paper_trading.py --force
 
-run_paper_trading_mr.py
+scripts\archive\run_paper_trading_mr.py  [ARCHIVED — § 10 I4]
   Purpose: Legacy daily paper-trading runner for Mean Reversion.
-  Usage:   mean_reversion\venv\Scripts\python.exe run_paper_trading_mr.py
-           mean_reversion\venv\Scripts\python.exe run_paper_trading_mr.py --force
+  Usage:   mean_reversion\venv\Scripts\python.exe scripts\archive\run_paper_trading_mr.py
+           mean_reversion\venv\Scripts\python.exe scripts\archive\run_paper_trading_mr.py --force
 
-run_paper_trading_vb.py
+scripts\archive\run_paper_trading_vb.py  [ARCHIVED — § 10 I4]
   Purpose: Legacy daily paper-trading runner for Volatility Breakout.
-  Usage:   volatility_breakout\venv\Scripts\python.exe run_paper_trading_vb.py
+  Usage:   volatility_breakout\venv\Scripts\python.exe scripts\archive\run_paper_trading_vb.py
 
-run_all_backtests.py
+scripts\archive\run_all_backtests.py  [ARCHIVED — § 10 I4]
   Purpose: Run backtests for MR, TF, and VB strategies in sequence.
-  Usage:   python run_all_backtests.py
+  Usage:   python scripts\archive\run_all_backtests.py
 
 mean_reversion\run_backtest.py
   Purpose: Standalone MR backtest runner.
@@ -383,29 +383,29 @@ get_result_data.py
   Purpose: Cross-service results summary from MR, TF, sentiment, and risk DBs.
   Usage:   python get_result_data.py
 
-cleanup_orphaned_tf_positions.py
+scripts\archive\cleanup_orphaned_tf_positions.py  [ARCHIVED — § 10 I4]
   Purpose: One-time cleanup of MU/LLY/ASML positions that moved out of TF universe.
-  Usage:   python cleanup_orphaned_tf_positions.py
+  Usage:   python scripts\archive\cleanup_orphaned_tf_positions.py
 
-clear_vb_lock.py
+scripts\archive\clear_vb_lock.py  [ARCHIVED — § 10 I4]
   Purpose: Delete a specific VB run_log row (hard-coded date 2026-06-10).
-  Usage:   python clear_vb_lock.py
+  Usage:   python scripts\archive\clear_vb_lock.py
 
-clear_vb_lock_today.py
+scripts\archive\clear_vb_lock_today.py  [ARCHIVED — § 10 I4]
   Purpose: Delete a specific VB run_log row (hard-coded date 2026-06-12).
-  Usage:   python clear_vb_lock_today.py
+  Usage:   python scripts\archive\clear_vb_lock_today.py
 
 update_configs.py
   Purpose: Add tickers and sector mappings to strategy config files.
   Usage:   python update_configs.py
 
-add_macd.py, fix_mr_obv.py, fix_tf_gen.py, fix_vb_cfg.py, fix_vb_gen.py
+scripts\archive\{add_macd,fix_mr_obv,fix_tf_gen,fix_vb_cfg,fix_vb_gen}.py  [ARCHIVED — § 10 I4]
   Purpose: One-time code/config patching scripts.  Review before re-running.
-  Usage:   python add_macd.py
-           python fix_mr_obv.py
-           python fix_tf_gen.py
-           python fix_vb_cfg.py
-           python fix_vb_gen.py
+  Usage:   python scripts\archive\add_macd.py
+           python scripts\archive\fix_mr_obv.py
+           python scripts\archive\fix_tf_gen.py
+           python scripts\archive\fix_vb_cfg.py
+           python scripts\archive\fix_vb_gen.py
 
 ================================================================================
 7. SCHEDULER / POWERSHELL / BATCH WRAPPERS

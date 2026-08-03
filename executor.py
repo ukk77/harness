@@ -163,6 +163,8 @@ class PaperExecutor:
 
     def _submit_to_alpaca(self, signal: ReconciledSignal, shares: float) -> None:
         """Mirror the paper trade to Alpaca paper account. Errors are non-fatal."""
+        if not getattr(self.cfg, "alpaca_mirror_enabled", True):
+            return
         broker = self._get_broker()
         if broker is None:
             return
@@ -205,14 +207,39 @@ class PaperExecutor:
         if signal.action == "BUY":
             current_shares = (position or {}).get("shares", 0.0)
             current_entry = (position or {}).get("entry_price", signal.price)
+            current_entry_conf = (position or {}).get("entry_confidence") or 0.0
+
+            # S2: DCA-into-losers guard — block adding to an existing position that
+            # is underwater beyond dca_loss_guard_pct, unless the new signal's
+            # confidence exceeds the position's running average entry confidence.
+            if current_shares > 0 and current_entry > 0:
+                pnl_pct = (signal.price - current_entry) / current_entry
+                if pnl_pct < -self.cfg.dca_loss_guard_pct and signal.confidence <= current_entry_conf:
+                    log.warning(
+                        "BLOCKED add-to-position %s — underwater %.1f%% (limit -%.1f%%) "
+                        "and new confidence %.2f <= entry confidence %.2f",
+                        signal.ticker, pnl_pct * 100, self.cfg.dca_loss_guard_pct * 100,
+                        signal.confidence, current_entry_conf,
+                    )
+                    return False
+
             new_shares = current_shares + shares
 
             if new_shares > 0:
                 avg_entry = (
                     (current_shares * current_entry + shares * signal.price) / new_shares
                 )
+                avg_entry_conf = (
+                    (current_shares * current_entry_conf + shares * signal.confidence) / new_shares
+                )
             else:
                 avg_entry = signal.price
+                avg_entry_conf = signal.confidence
+
+            # S1: persist entry-time exit context instead of discarding it.
+            stop_price = None
+            if signal.suggested_stop_pct is not None:
+                stop_price = avg_entry * (1 - signal.suggested_stop_pct)
 
             self.db.upsert_position(
                 ticker=signal.ticker,
@@ -221,6 +248,10 @@ class PaperExecutor:
                 entry_price=avg_entry,
                 current_price=signal.price,
                 unrealized_pnl=(signal.price - avg_entry) * new_shares,
+                stop_price=stop_price,
+                expected_hold_days=signal.expected_hold_days,
+                risk_bucket=signal.risk_bucket,
+                entry_confidence=avg_entry_conf,
             )
             self.db.record_trade(
                 ticker=signal.ticker,
@@ -324,6 +355,23 @@ class AlpacaExecutor:
                 log.warning("BLOCKED %s %s — %s", signal.action, signal.ticker, reason)
                 return False
 
+        # S2: DCA-into-losers guard — same rule as PaperExecutor.
+        if signal.action == "BUY":
+            pos = self._db.get_position(signal.ticker, "harness")
+            current_shares = (pos or {}).get("shares", 0.0)
+            current_entry = (pos or {}).get("entry_price", signal.price)
+            current_entry_conf = (pos or {}).get("entry_confidence") or 0.0
+            if current_shares > 0 and current_entry > 0:
+                pnl_pct = (signal.price - current_entry) / current_entry
+                if pnl_pct < -self.cfg.dca_loss_guard_pct and signal.confidence <= current_entry_conf:
+                    log.warning(
+                        "BLOCKED add-to-position %s — underwater %.1f%% (limit -%.1f%%) "
+                        "and new confidence %.2f <= entry confidence %.2f",
+                        signal.ticker, pnl_pct * 100, self.cfg.dca_loss_guard_pct * 100,
+                        signal.confidence, current_entry_conf,
+                    )
+                    return False
+
         if dry_run:
             log.info(
                 "DRY-RUN ALPACA %s %s  %.2f shares @ ~$%.2f",
@@ -396,6 +444,9 @@ class AlpacaExecutor:
             
             # Update position locally
             if signal.action == "BUY":
+                stop_price = None
+                if signal.suggested_stop_pct is not None:
+                    stop_price = fill_price * (1 - signal.suggested_stop_pct)
                 self._db.update_position(
                     ticker=signal.ticker,
                     strategy="harness",
@@ -404,6 +455,10 @@ class AlpacaExecutor:
                     current_price=fill_price,
                     unrealized_pnl=0.0,
                     realized_pnl=0.0,
+                    stop_price=stop_price,
+                    expected_hold_days=signal.expected_hold_days,
+                    risk_bucket=signal.risk_bucket,
+                    entry_confidence=signal.confidence,
                 )
             elif signal.action == "SELL":
                 pos = self._db.get_position(signal.ticker, "harness")

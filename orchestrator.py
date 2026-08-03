@@ -34,6 +34,51 @@ log = logging.getLogger(__name__)
 _TRADING_ROOT = Path(__file__).resolve().parent.parent
 
 
+def should_trip_bear_vol_circuit_breaker(
+    spy_ohlcv,
+    bear_vol_threshold: float,
+) -> "tuple[bool, Optional[str]]":
+    """Return (tripped, reason) for the bear+high-vol circuit breaker (§ 10 S4).
+
+    Trips only when SPY is genuinely trending down (below 200-SMA AND negative
+    20-day momentum) AND annualized 20-day realized vol is >= bear_vol_threshold.
+    Deliberately does NOT use the discrete Regime enum — BEAR_TREND alone is a
+    common, tradeable regime and HIGH_VOL classification doesn't check
+    direction (a violent bullish spike can also be HIGH_VOL).
+    """
+    try:
+        feats = compute_regime_features(spy_ohlcv).iloc[-1]
+        realised_vol = float(feats["realised_vol_20d"])
+        bearish_direction = float(feats["sma200_dist_pct"]) < 0 and float(feats["mom_20d"]) < 0
+        elevated_vol = realised_vol >= bear_vol_threshold
+    except Exception:
+        return False, None
+
+    if bearish_direction and elevated_vol:
+        reason = (f"bearish trend + elevated realized vol "
+                  f"({realised_vol:.1%} >= {bear_vol_threshold:.0%})")
+        return True, reason
+    return False, None
+
+
+def apply_circuit_breaker(results: Dict[str, List[HarnessSignal]]) -> int:
+    """Demote all BUY/SHORT signals to HOLD in place; SELL/COVER signals are untouched.
+
+    Extracted as a standalone function (§ 10 I1) so the circuit-breaker's actual
+    behavior — not just that a config flag exists — can be asserted directly in
+    tests. Returns the number of signals demoted.
+    """
+    blocked = 0
+    for sig_list in results.values():
+        for sig in sig_list:
+            if sig.action in ("BUY", "SHORT"):
+                sig.action = "HOLD"
+                sig.confidence = 0.0
+                sig.reason = f"blocked:circuit_breaker | {sig.reason}"
+                blocked += 1
+    return blocked
+
+
 def _progress(done: int, total: int, label: str = "") -> None:
     """Print an in-place progress bar to stdout."""
     pct = done / total * 100 if total else 0
@@ -194,11 +239,29 @@ class Orchestrator:
             print(f"  Regime: {regime.value.upper()} [{self.cfg.regime_mode}]  |  Allocation: " +
                   "  ".join(f"{a.strategy}={a.capital:,.0f}" for a in allocation.allocations))
             
-            # Circuit breaker check 1: Regime
-            if self.cfg.circuit_breaker_extreme_bearish and regime == Regime.BEAR_TREND:
-                # Basic check, ideally we check for HIGH_VOL + BEAR_TREND
-                pass
-                
+            # Circuit breaker check 1: Regime (§ 10 S4, revised).
+            # The original intent was "bear + high vol" — a genuinely extreme,
+            # rare condition — NOT "any bear trend". A first pass tripped on
+            # `regime in (BEAR_TREND, HIGH_VOL)`, which fired on nearly every
+            # cycle once regime got stuck at BEAR_TREND, blocking essentially
+            # all new entries (including for strategies, like MR, whose edge
+            # is trading *within* a bear market). The discrete Regime enum
+            # can't represent "bear AND high_vol" simultaneously either
+            # (detect_regime's heuristic gives HIGH_VOL classification
+            # priority over trend calls regardless of direction — a violent
+            # bullish spike can also classify as HIGH_VOL). Use the underlying
+            # continuous SPY features directly instead: only trip when price
+            # is genuinely trending down (below 200-SMA AND negative 20d
+            # momentum) AND realized vol is elevated.
+            if self.cfg.circuit_breaker_extreme_bearish:
+                tripped, reason = should_trip_bear_vol_circuit_breaker(
+                    spy_ohlcv, self.cfg.circuit_breaker_bear_vol_threshold
+                )
+                if tripped:
+                    log.warning("CIRCUIT BREAKER TRIGGERED: %s — blocking new entries", reason)
+                    print(f"\n  CIRCUIT BREAKER: {reason} — new entries (BUY/SHORT) blocked.\n")
+                    circuit_breaker_tripped = True
+
             # Circuit breaker check 2: True intraday drawdown
             dd_pct = self._intraday_drawdown()
             if dd_pct is not None and dd_pct > self.cfg.circuit_breaker_drawdown_pct:
@@ -299,14 +362,7 @@ class Orchestrator:
 
         # Circuit breaker: demote any new-entry signals, leave exits intact
         if circuit_breaker_tripped:
-            blocked = 0
-            for sig_list in results.values():
-                for sig in sig_list:
-                    if sig.action in ("BUY", "SHORT"):
-                        sig.action = "HOLD"
-                        sig.confidence = 0.0
-                        sig.reason = f"blocked:circuit_breaker | {sig.reason}"
-                        blocked += 1
+            blocked = apply_circuit_breaker(results)
             if blocked:
                 log.info("[orchestrator] Circuit breaker blocked %d entry signal(s); exits preserved", blocked)
                 print(f"  Circuit breaker: blocked {blocked} entry signal(s). SELL/COVER signals preserved.")

@@ -65,6 +65,16 @@ class MRAdapter(BaseAdapter):
         if action == "HOLD":
             confidence = 0.0
 
+        # S1: derive exit-context metadata from the strategy's own stop/hold config
+        # rather than discarding it — see Master Spec § 10 S1.
+        suggested_stop_pct: Optional[float] = None
+        if sig.atr_stop is not None and price > 0:
+            suggested_stop_pct = abs(price - float(sig.atr_stop)) / price
+
+        expected_hold_days: Optional[int] = None
+        if getattr(cfg.bollinger, "max_hold_days", 0):
+            expected_hold_days = int(cfg.bollinger.max_hold_days)
+
         return HarnessSignal(
             ticker=ticker,
             timestamp=datetime.now(),
@@ -74,4 +84,6 @@ class MRAdapter(BaseAdapter):
             price=price,
             suggested_shares=None,
             reason=sig.reason,
+            suggested_stop_pct=suggested_stop_pct,
+            expected_hold_days=expected_hold_days,
         )

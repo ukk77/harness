@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 from .base import BaseAdapter, HarnessSignal
 
@@ -62,6 +63,13 @@ class TFAdapter(BaseAdapter):
         if action == "HOLD":
             confidence = 0.0
 
+        # S1: derive exit-context metadata from the strategy's own stop config
+        # rather than discarding it — see Master Spec § 10 S1. TF has no native
+        # max-hold-days concept, so expected_hold_days is left unset (honest gap).
+        suggested_stop_pct: Optional[float] = None
+        if sig.atr_stop is not None and price > 0:
+            suggested_stop_pct = abs(price - float(sig.atr_stop)) / price
+
         return HarnessSignal(
             ticker=ticker,
             timestamp=datetime.now(),
@@ -71,4 +79,5 @@ class TFAdapter(BaseAdapter):
             price=price,
             suggested_shares=None,
             reason=sig.reason,
+            suggested_stop_pct=suggested_stop_pct,
         )
